@@ -3,11 +3,13 @@
 政府電子採購網 (PCC) - AI 與資訊勞務最低標標案爬蟲設定檔
 """
 
-import os
-
 # ==================== 關鍵字與篩選條件設定 ====================
 
-# 1. 搜尋關鍵字清單 (涵蓋 AI、資訊、網站、軟體、系統、資安等廣泛領域，自動逐一搜尋並去重)
+# 1. 搜尋關鍵字清單 (涵蓋 AI、資訊、網站、軟體、系統、資安等領域，自動逐一搜尋並去重)
+#
+# 註：採購網的標案名稱查詢為「子字串比對」，因此若清單中已有「資訊」，
+#     再放「資訊系統」「資訊安全」等只會回傳前者的子集合，徒增請求數與伺服器負擔。
+#     以下清單已刻意移除這類被涵蓋的關鍵字。
 DEFAULT_KEYWORDS = [
     # AI 相關
     "AI",
@@ -16,28 +18,20 @@ DEFAULT_KEYWORDS = [
     "深度學習",
     "大型語言模型",
     "LLM",
-    "生成式AI",
     "演算法",
     "大數據",
     "智慧化",
     # 資訊 / 網路 / 系統 / 軟體 相關
     "資訊",
-    "資訊系統",
-    "資訊軟體",
-    "資訊服務",
     "軟體",
-    "軟體開發",
     "網站",
     "系統",
     "平台",
     "資安",
-    "資訊安全",
     "資料庫",
     "網路",
     "雲端",
-    "雲端服務",
     "數位",
-    "數位轉型",
     "APP",
     "程式",
 ]
@@ -57,10 +51,3 @@ OUTPUT_DIR = "output"
 EXPORT_EXCEL = True
 EXPORT_CSV = True
 EXPORT_JSON = False
-
-# 6. Webhook 通知設定 (可填入 LINE Notify Token 或 Discord Webhook URL)
-NOTIFY_CONFIG = {
-    "enabled": False,
-    "line_notify_token": os.getenv("LINE_NOTIFY_TOKEN", ""),
-    "discord_webhook_url": os.getenv("DISCORD_WEBHOOK_URL", ""),
-}
