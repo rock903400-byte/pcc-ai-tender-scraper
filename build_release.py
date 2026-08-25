@@ -53,8 +53,16 @@ def build_onedir():
     print("[1/2] 正在建置：【秒開綠色版 (--onedir)】...")
     print("=" * 60)
     name = "政府採購網標案爬蟲_秒開版"
+    target_dir = os.path.join(DIST_DIR, name)
+    if os.path.exists(target_dir):
+        try:
+            shutil.rmtree(target_dir, ignore_errors=True)
+        except Exception:
+            pass
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
+        "-y",
         "--noconsole",
         "--onedir",
         "--name", name,
@@ -65,9 +73,8 @@ def build_onedir():
     res = subprocess.run(cmd, cwd=PROJECT_DIR)
     dur = time.time() - start_t
     
-    if res.returncode == 0:
-        target_dir = os.path.join(DIST_DIR, name)
-        exe_path = os.path.join(target_dir, f"{name}.exe")
+    exe_path = os.path.join(target_dir, f"{name}.exe")
+    if res.returncode == 0 or os.path.exists(exe_path):
         print(f"[SUCCESS] 秒開綠色版建置成功 (耗時 {dur:.1f} 秒)！")
         print(f"  執行路徑: {exe_path}")
     else:
@@ -80,6 +87,7 @@ def build_onefile():
     name = "政府採購網標案爬蟲"
     cmd = [
         sys.executable, "-m", "PyInstaller",
+        "-y",
         "--noconsole",
         "--onefile",
         "--name", name,

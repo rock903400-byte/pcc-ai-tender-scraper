@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 政府電子採購網 (web.pcc.gov.tw) - AI 與資訊勞務最低標標案爬蟲
-專門抓取最新標案公告，精準過濾「勞務類」與「最低標」之標案。
+專門抓取最新標案公告，並即時檢索官方詳細頁精準判定「勞務類」與「最低標」（精確區分參考最有利標與最低標）。
 """
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -110,42 +111,55 @@ def parse_total_pages(html_content: str) -> int:
     return 1
 
 
-def determine_award_method(tender_way: str, award_field: str = "") -> tuple:
+def fetch_actual_award_method(pk: str) -> str:
+    """向官方詳細頁發送請求，精準萃取真實『決標方式』"""
+    if not pk:
+        return ""
+    url = f"{DETAIL_URL}?pkPmsMain={pk}"
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with opener.open(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        
+        match = re.search(r'決標方式\s*</t[hd]>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL)
+        if match:
+            val = " ".join(re.sub(r'<[^>]+>', '', match.group(1)).split())
+            if val:
+                return val
+
+        match2 = re.search(r'決標方式.*?</td>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL)
+        if match2:
+            val = " ".join(re.sub(r'<[^>]+>', '', match2.group(1)).split())
+            if val:
+                return val
+    except Exception:
+        pass
+    return ""
+
+
+def determine_award_method(tender_way: str, actual_award_str: str = "") -> tuple:
     """
-    精確判定決標方式（最低標 vs 最有利標/評選）
-    1. 若已有詳細內文欄位，優先依據詳細欄位判定
-    2. 否則依政府採購法法定招標機制判定：
-       - 公開取得報價單或企劃書 -> 最低標 (依採購法第49條取報價單比減價)
-       - 公開招標 -> 最低標 (依採購法第52條第1項第1/2款)
-       - 選擇性招標 -> 最低標
-       - 經公開評選之限制性招標 / 準用最有利標 / 評選 -> 最有利標/評選
+    精確判定決標方式（最低標 vs 參考最有利標/最有利標/評選）
+    1. 若已有詳細頁中的決標方式欄位，以真實欄位為最高準則！
+    2. 否則安全依據招標方式推估
     """
-    if award_field:
-        award_field_clean = award_field.strip()
-        if "最低標" in award_field_clean:
-            return award_field_clean, True
-        elif "最有利標" in award_field_clean or "評選" in award_field_clean:
-            return award_field_clean, False
+    if actual_award_str:
+        s = actual_award_str.strip()
+        if "參考最有利標" in s or "最有利標" in s or "評審" in s or "評選" in s:
+            return s, False
+        elif "最低標" in s:
+            return s, True
+        return s, ("最低標" in s)
 
     tender_way = tender_way.strip()
-
-    # 1. 評選 / 最有利標
     if "評選" in tender_way or "最有利標" in tender_way or "評審" in tender_way:
         return "最有利標 / 評選", False
-    
-    # 2. 公開取得（公開取得報價單或企劃書，法定為最低標）
     elif "公開取得" in tender_way:
-        return "最低標 (公開取得)", True
-    
-    # 3. 公開招標
+        return "公開取得 (待確認)", True
     elif "公開招標" in tender_way:
         return "最低標 (公開招標)", True
-    
-    # 4. 選擇性招標
     elif "選擇性招標" in tender_way:
         return "最低標 (選擇性招標)", True
-    
-    # 5. 限制性招標
     elif "限制性招標" in tender_way:
         return "限制性招標", False
 
@@ -203,7 +217,7 @@ def parse_tender_rows(html_doc: str, keyword: str) -> list:
             "招標機關": org_name,
             "招標方式": tender_way,
             "採購性質": proc_type,
-            "預估決標方式": award_method_desc,
+            "決標方式": award_method_desc,
             "預算金額": budget + " 元" if budget and not budget.endswith("元") else budget,
             "公告日期": to_ad_date(pub_date),
             "截止投標": deadline,
@@ -230,7 +244,7 @@ def search_pcc(keyword: str, start_date_roc: str, end_date_roc: str, max_pages: 
         "tenderName": keyword,
         "tenderId": "",
         "tenderType": "TENDER_DECLARATION",
-        "tenderWay": "",  # 空白代表不限招標方式
+        "tenderWay": "",
         "dateType": "isSpdt",
         "tenderStartDate": start_date_roc,
         "tenderEndDate": end_date_roc,
@@ -268,6 +282,29 @@ def search_pcc(keyword: str, start_date_roc: str, end_date_roc: str, max_pages: 
     return all_tenders
 
 
+def enrich_actual_award_methods(tenders: list, max_workers: int = 6):
+    """使用多執行緒平行連線官方詳細頁，精準確認真實決標方式"""
+    if not tenders:
+        return
+    
+    print(f"[*] 正在連線官方詳細頁精準校驗決標方式 (共 {len(tenders)} 筆標案)...")
+    
+    def _fetch_and_update(t):
+        pk = t.get("pk")
+        if not pk:
+            return
+        actual_award = fetch_actual_award_method(pk)
+        if actual_award:
+            award_desc, is_lowest = determine_award_method(t.get("招標方式", ""), actual_award)
+            t["決標方式"] = award_desc
+            t["是否為最低標"] = "是" if is_lowest else "否"
+            is_service = (t.get("是否為勞務類") == "是")
+            t["完全符合目標"] = "符合 (勞務+最低標)" if (is_service and is_lowest) else "其他"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(_fetch_and_update, tenders))
+
+
 def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: str):
     """執行爬蟲主流程"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -297,7 +334,7 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
             else:
                 if kw not in unique_tenders[tid]["命中關鍵字群"]:
                     unique_tenders[tid]["命中關鍵字群"].append(kw)
-        time.sleep(0.8)
+        time.sleep(0.6)
 
     tenders_list = list(unique_tenders.values())
     for t in tenders_list:
@@ -309,6 +346,9 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
     if total_found == 0:
         print("[INFO] 本次搜尋區間內未發現任何標案。")
         return
+
+    # 執行真實決標方式深度校驗
+    enrich_actual_award_methods(tenders_list)
 
     matched_tenders = [
         t for t in tenders_list
@@ -326,7 +366,7 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
         for i, m in enumerate(matched_tenders, 1):
             print(f"  {i}. [{m['公告日期']}] {m['招標機關']} - {m['標案名稱']}")
             print(f"     案號: {m['標案案號']} | 預算: {m['預算金額']} | 截止投標: {m['截止投標']}")
-            print(f"     招標方式: {m['招標方式']} | 預估決標: {m['預估決標方式']}")
+            print(f"     招標方式: {m['招標方式']} | 決標方式: {m['決標方式']}")
             print(f"     連結: {m['詳細連結']}\n")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -338,7 +378,7 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
         df_matched = pd.DataFrame(matched_tenders)
         
         preferred_cols = [
-            "完全符合目標", "標案名稱", "招標機關", "預算金額", "預估決標方式", "招標方式",
+            "完全符合目標", "標案名稱", "招標機關", "預算金額", "決標方式", "招標方式",
             "採購性質", "公告日期", "截止投標", "命中關鍵字", "標案案號", "詳細連結"
         ]
         

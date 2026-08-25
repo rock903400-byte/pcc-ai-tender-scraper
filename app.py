@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 政府電子採購網 - AI 與資訊勞務最低標標案爬蟲 GUI 應用程式
-使用 ttkbootstrap 建構現代化桌面介面，支援多執行緒搜尋、即時進度、表格展示與 Excel 匯出。
+使用 ttkbootstrap 建構現代化桌面介面，支援多執行緒搜尋、官方詳細頁真實決標方式深度校驗、即時進度、表格展示與 Excel 匯出。
 """
 
+import concurrent.futures
 import csv
 import json
 import os
@@ -42,6 +43,7 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 BASE_URL = "https://web.pcc.gov.tw"
 BASIC_SEARCH_URL = BASE_URL + "/prkms/tender/common/basic/readTenderBasic"
 BASIC_INDEX_URL = BASE_URL + "/prkms/tender/common/basic/indexTenderBasic"
+DETAIL_URL = BASE_URL + "/tps/QueryTender/query/searchTenderDetail"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -69,42 +71,55 @@ def to_ad_date(date_str: str) -> str:
     return date_str
 
 
-def determine_award_method(tender_way: str, award_field: str = "") -> tuple:
+def fetch_actual_award_method(pk: str) -> str:
+    """向官方詳細頁發送請求，精準萃取真實『決標方式』"""
+    if not pk:
+        return ""
+    url = f"{DETAIL_URL}?pkPmsMain={pk}"
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with opener.open(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        
+        match = re.search(r'決標方式\s*</t[hd]>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL)
+        if match:
+            val = " ".join(re.sub(r'<[^>]+>', '', match.group(1)).split())
+            if val:
+                return val
+
+        match2 = re.search(r'決標方式.*?</td>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL)
+        if match2:
+            val = " ".join(re.sub(r'<[^>]+>', '', match2.group(1)).split())
+            if val:
+                return val
+    except Exception:
+        pass
+    return ""
+
+
+def determine_award_method(tender_way: str, actual_award_str: str = "") -> tuple:
     """
-    精確判定決標方式（最低標 vs 最有利標/評選）
-    1. 若已有詳細內文欄位，優先依據詳細欄位判定
-    2. 否則依政府採購法法定招標機制判定：
-       - 公開取得報價單或企劃書 -> 最低標 (依採購法第49條取報價單比減價)
-       - 公開招標 -> 最低標 (依採購法第52條第1項第1/2款)
-       - 選擇性招標 -> 最低標
-       - 經公開評選之限制性招標 / 準用最有利標 / 評選 -> 最有利標/評選
+    精確判定決標方式（最低標 vs 參考最有利標/最有利標/評選）
+    1. 若已有詳細頁中的決標方式欄位，以真實欄位為最高準則！
+    2. 否則安全依據招標方式推估
     """
-    if award_field:
-        award_field_clean = award_field.strip()
-        if "最低標" in award_field_clean:
-            return award_field_clean, True
-        elif "最有利標" in award_field_clean or "評選" in award_field_clean:
-            return award_field_clean, False
+    if actual_award_str:
+        s = actual_award_str.strip()
+        if "參考最有利標" in s or "最有利標" in s or "評審" in s or "評選" in s:
+            return s, False
+        elif "最低標" in s:
+            return s, True
+        return s, ("最低標" in s)
 
     tender_way = tender_way.strip()
-
-    # 1. 評選 / 最有利標
     if "評選" in tender_way or "最有利標" in tender_way or "評審" in tender_way:
         return "最有利標 / 評選", False
-    
-    # 2. 公開取得（公開取得報價單或企劃書，法定為最低標）
     elif "公開取得" in tender_way:
-        return "最低標 (公開取得)", True
-    
-    # 3. 公開招標
+        return "公開取得 (待確認)", True
     elif "公開招標" in tender_way:
         return "最低標 (公開招標)", True
-    
-    # 4. 選擇性招標
     elif "選擇性招標" in tender_way:
         return "最低標 (選擇性招標)", True
-    
-    # 5. 限制性招標
     elif "限制性招標" in tender_way:
         return "限制性招標", False
 
@@ -161,7 +176,7 @@ def parse_tender_rows(html_doc: str, keyword: str) -> list:
             "招標機關": org_name,
             "招標方式": tender_way,
             "採購性質": proc_type,
-            "預估決標方式": award_method_desc,
+            "決標方式": award_method_desc,
             "預算金額": budget + " 元" if budget and not budget.endswith("元") else budget,
             "公告日期": to_ad_date(pub_date),
             "截止投標": deadline,
@@ -314,7 +329,7 @@ class PCCScraperApp(tb.Window):
         tree.heading("org", text="招標機關")
         tree.heading("title", text="標案名稱")
         tree.heading("budget", text="預算金額")
-        tree.heading("award", text="預估決標方式")
+        tree.heading("award", text="決標方式")
         tree.heading("way", text="招標方式")
         tree.heading("deadline", text="截止投標")
         tree.heading("keyword", text="命中關鍵字")
@@ -324,8 +339,8 @@ class PCCScraperApp(tb.Window):
         tree.column("org", width=160, anchor="w")
         tree.column("title", width=340, anchor="w")
         tree.column("budget", width=110, anchor="e")
-        tree.column("award", width=130, anchor="center")
-        tree.column("way", width=160, anchor="w")
+        tree.column("award", width=140, anchor="center")
+        tree.column("way", width=150, anchor="w")
         tree.column("deadline", width=95, anchor="center")
         tree.column("keyword", width=100, anchor="center")
 
@@ -395,7 +410,7 @@ class PCCScraperApp(tb.Window):
                     t.get("招標機關", ""),
                     t.get("標案名稱", ""),
                     t.get("預算金額", ""),
-                    t.get("預估決標方式", ""),
+                    t.get("決標方式", ""),
                     t.get("招標方式", ""),
                     t.get("截止投標", ""),
                     t.get("命中關鍵字", "")
@@ -459,7 +474,7 @@ class PCCScraperApp(tb.Window):
                     "tenderName": kw,
                     "tenderId": "",
                     "tenderType": "TENDER_DECLARATION",
-                    "tenderWay": "",  # 不限招標方式（涵蓋公開取得、公開招標、法人補助等）
+                    "tenderWay": "",
                     "dateType": "isSpdt",
                     "tenderStartDate": start_roc,
                     "tenderEndDate": end_roc,
@@ -489,18 +504,43 @@ class PCCScraperApp(tb.Window):
                 except Exception as e:
                     self.log(f"  ⚠️ 關鍵字【{kw}】搜尋發生例外: {e}")
 
-                progress = int((idx / total_kws) * 100)
+                progress = int((idx / (total_kws + 1)) * 100)
                 self.after(0, self.update_progress, progress)
-                time.sleep(0.6)
+                time.sleep(0.5)
 
-            self.tenders_all = list(unique_tenders.values())
-            for t in self.tenders_all:
+            tenders_list = list(unique_tenders.values())
+            
+            # 多執行緒校驗官方詳細頁中的真實決標方式
+            if tenders_list:
+                self.log(f"⚡ 正在平行連線官方詳細頁，校驗真實決標方式 (共 {len(tenders_list)} 筆)...")
+                def _enrich(t):
+                    pk = t.get("pk")
+                    if pk:
+                        actual = fetch_actual_award_method(pk)
+                        if actual:
+                            desc, is_lowest = determine_award_method(t.get("招標方式", ""), actual)
+                            t["決標方式"] = desc
+                            t["是否為最低標"] = "是" if is_lowest else "否"
+                            is_service = (t.get("是否為勞務類") == "是")
+                            t["完全符合目標"] = "符合 (勞務+最低標)" if (is_service and is_lowest) else "其他"
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                    list(executor.map(_enrich, tenders_list))
+
+            for t in tenders_list:
                 t["命中關鍵字"] = ", ".join(t.get("命中關鍵字群", []))
 
+            self.tenders_all = tenders_list
             self.tenders_matched = []
             for t in self.tenders_all:
                 attr_ok = (target_attr == "不限") or (target_attr in t.get("採購性質", ""))
-                award_ok = (target_award == "不限") or (t.get("是否為最低標") == "是" if target_award == "最低標" else "最有利標" in t.get("預估決標方式", ""))
+                if target_award == "最低標":
+                    award_ok = (t.get("是否為最低標") == "是")
+                elif target_award == "最有利標/評選":
+                    award_ok = ("最有利標" in t.get("決標方式", "") or "評選" in t.get("決標方式", "") or "評審" in t.get("決標方式", ""))
+                else:
+                    award_ok = True
+
                 if attr_ok and award_ok:
                     self.tenders_matched.append(t)
 
@@ -537,7 +577,7 @@ class PCCScraperApp(tb.Window):
             excel_path = os.path.join(self.output_dir, f"pcc_tenders_{timestamp}.xlsx")
             
             preferred_cols = [
-                "完全符合目標", "標案名稱", "招標機關", "預算金額", "預估決標方式", "招標方式",
+                "完全符合目標", "標案名稱", "招標機關", "預算金額", "決標方式", "招標方式",
                 "採購性質", "公告日期", "截止投標", "命中關鍵字", "標案案號", "詳細連結"
             ]
 
@@ -574,7 +614,7 @@ class PCCScraperApp(tb.Window):
 
         try:
             preferred_cols = [
-                "完全符合目標", "標案名稱", "招標機關", "預算金額", "預估決標方式", "招標方式",
+                "完全符合目標", "標案名稱", "招標機關", "預算金額", "決標方式", "招標方式",
                 "採購性質", "公告日期", "截止投標", "命中關鍵字", "標案案號", "詳細連結"
             ]
             df_all = pd.DataFrame(self.tenders_all)
