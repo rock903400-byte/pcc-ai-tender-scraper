@@ -31,7 +31,7 @@ core.install_ipv4_preference()
 def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: str,
                 date_mode: str = core.DATE_MODE_SPDT, verify: bool = True,
                 verify_limit: int = core.DEFAULT_VERIFY_LIMIT,
-                only_keyword_hits: bool = False):
+                include_keyword_misses: bool = False):
     """執行爬蟲主流程（全面掃描該條件下的標案，關鍵字僅用於標記）"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -68,10 +68,6 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
     print(f"\n[INFO] 掃描完畢！共取得 {len(tenders_list)} 筆不重複標案"
           f"（其中 {hits} 筆命中關鍵字）。")
 
-    if only_keyword_hits:
-        tenders_list = [t for t in tenders_list if t.get("命中關鍵字群")]
-        print(f"[INFO] 已套用 --only-keyword-hits，保留 {len(tenders_list)} 筆命中關鍵字的標案。")
-
     core.finalize_keywords(tenders_list)
 
     if not tenders_list:
@@ -81,7 +77,8 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
     # 只校驗有機會入選的標案，避免上千次請求被站方驗證碼防護擋下
     if verify:
         targets = core.select_rows_for_enrichment(tenders_list, target_attr, target_award_way,
-                                                  limit=verify_limit)
+                                                  limit=verify_limit,
+                                                  require_keyword_hit=not include_keyword_misses)
         if targets:
             print(f"\n[VERIFY] 從 {len(tenders_list)} 筆中挑出 {len(targets)} 筆候選，"
                   f"連線官方詳細頁校驗決標方式...")
@@ -91,16 +88,24 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
     else:
         print(f"\n[VERIFY] 已略過深度校驗，決標方式全部為「{core.AWARD_SOURCE_ESTIMATED}」。")
 
-    matched_tenders = core.filter_tenders(tenders_list, target_attr, target_award_way)
+    # 精選 = 採購性質 ∩ 決標方式 ∩ 命中關鍵字；未命中者不會被丟掉，仍在「所有搜尋標案」。
+    qualified = core.filter_tenders(tenders_list, target_attr, target_award_way)
+    keyword_hits = core.filter_tenders(tenders_list, target_attr, target_award_way,
+                                       require_keyword_hit=True)
+    matched_tenders = qualified if include_keyword_misses else keyword_hits
 
     print("\n" + "=" * 65)
     print("[SUMMARY] 執行成果摘要")
     print(f"  • 全部搜尋到標案: {len(tenders_list)} 筆")
-    print(f"  • 完全符合【{target_attr} + {target_award_way}】: {len(matched_tenders)} 筆")
+    print(f"  • 符合【{target_attr} + {target_award_way}】: {len(qualified)} 筆"
+          f"（其中命中關鍵字 {len(keyword_hits)} 筆）")
+    print(f"  • 精選清單: {len(matched_tenders)} 筆"
+          + ("（含未命中關鍵字者）" if include_keyword_misses else "（條件 ∩ 關鍵字）"))
     print("=" * 65)
 
     if matched_tenders:
-        print(f"\n🏆 精選【{target_attr} + {target_award_way}】標案清單：")
+        label = "" if include_keyword_misses else " ∩ 關鍵字"
+        print(f"\n🏆 精選【{target_attr} + {target_award_way}{label}】標案清單：")
         for i, m in enumerate(matched_tenders, 1):
             print(f"  {i}. [{m['公告日期']}] {m['招標機關']} - {m['標案名稱']}")
             print(f"     案號: {m['標案案號']} | 預算: {m['預算金額']} | 截止投標: {m['截止投標']}")
@@ -159,8 +164,8 @@ def main():
                         help="略過官方詳細頁的決標方式深度校驗（快，但決標方式僅為推估值）")
     parser.add_argument("--verify-limit", type=int, default=core.DEFAULT_VERIFY_LIMIT,
                         help=f"深度校驗的筆數上限 (預設: {core.DEFAULT_VERIFY_LIMIT}，0 表示不限)")
-    parser.add_argument("--only-keyword-hits", action="store_true",
-                        help="只保留標案名稱命中關鍵字的標案 (預設全部保留)")
+    parser.add_argument("--include-keyword-misses", action="store_true",
+                        help="精選清單改為納入未命中關鍵字的標案 (預設只收命中者)")
 
     args = parser.parse_args()
     run_crawler(
@@ -171,7 +176,7 @@ def main():
         date_mode=args.date_mode,
         verify=not args.no_verify,
         verify_limit=args.verify_limit,
-        only_keyword_hits=args.only_keyword_hits,
+        include_keyword_misses=args.include_keyword_misses,
     )
 
 

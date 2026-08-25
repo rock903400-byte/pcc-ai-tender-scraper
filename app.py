@@ -59,6 +59,10 @@ class PCCScraperApp(tb.Window):
 
         self.is_running = False
         self.tenders_all = []
+        # 精選有兩份：符合採購性質＋決標方式者，以及其中還命中關鍵字者。
+        # tenders_matched 永遠指向目前顯示中的那一份，排序與快速篩選才不必分兩套。
+        self.tenders_qualified = []
+        self.tenders_keyword_hits = []
         self.tenders_matched = []
         self.tenders_by_pk = {}
         self.output_dir = os.path.abspath("output")
@@ -212,6 +216,13 @@ class PCCScraperApp(tb.Window):
 
         if is_matched:
             self.filter_entry_matched = filter_entry
+            # 全面掃描會撈回整批勞務標案（午餐、粉刷、校外教學…），
+            # 精選預設只留命中關鍵字者；未命中者沒被丟掉，勾起來即可看回。
+            self.include_misses_var = tk.BooleanVar(value=False)
+            tb.Checkbutton(top_filter, text="包含未命中關鍵字",
+                           variable=self.include_misses_var,
+                           command=self.on_include_misses_toggled,
+                           bootstyle="round-toggle").pack(side=LEFT, padx=(0, 10))
         else:
             self.filter_entry_all = filter_entry
 
@@ -345,6 +356,38 @@ class PCCScraperApp(tb.Window):
             ))
             seq += 1
 
+    def include_misses(self) -> bool:
+        """僅限主執行緒呼叫（Tkinter 變數不可跨執行緒讀取）。"""
+        return bool(self.include_misses_var.get())
+
+    def _apply_matched_dataset(self):
+        """依核取方塊決定精選分頁顯示哪一份資料，並同步分頁標題。"""
+        self.tenders_matched = (self.tenders_qualified if self.include_misses()
+                                else self.tenders_keyword_hits)
+        self._update_matched_tab_title()
+
+    def on_include_misses_toggled(self):
+        """在「條件 ∩ 關鍵字」與「全部符合條件」兩份精選之間切換顯示。"""
+        self._apply_matched_dataset()
+
+        # 保留目前的排序方向與快速篩選文字，切換後不必重按一次
+        state = self.sort_state_matched
+        if state["col"]:
+            self.tenders_matched.sort(
+                key=lambda t: self.extract_sort_key(t, state["col"]), reverse=state["reverse"])
+        query = self.filter_entry_matched.get() if self.filter_entry_matched else ""
+        self.filter_treeview(self.tree_matched, query, is_matched=True)
+
+    def _update_matched_tab_title(self):
+        """分頁標題把被折疊的筆數也講出來，不讓標案無聲消失。"""
+        if self.include_misses():
+            text = f" 🏆 精選：{self.active_filter_label} ({len(self.tenders_qualified)} 筆) "
+        else:
+            misses = len(self.tenders_qualified) - len(self.tenders_keyword_hits)
+            text = (f" 🏆 精選：{self.active_filter_label}∩關鍵字 "
+                    f"({len(self.tenders_keyword_hits)} 筆，另 {misses} 筆未命中) ")
+        self.notebook.tab(0, text=text)
+
     def on_date_mode_changed(self):
         """等標期內模式下站方會忽略日期區間，因此把「查詢天數」停用以免誤導。"""
         if self.selected_date_type() == core.DATE_TYPE_RANGE:
@@ -398,6 +441,7 @@ class PCCScraperApp(tb.Window):
         target_award = self.award_combo.get()
         date_type = self.selected_date_type()
         verify = bool(self.verify_var.get())
+        include_misses = self.include_misses()
 
         self.active_filter_label = self._describe_filter(target_attr, target_award)
 
@@ -413,7 +457,7 @@ class PCCScraperApp(tb.Window):
 
         threading.Thread(
             target=self.run_scrape_thread,
-            args=(keywords, days, target_attr, target_award, date_type, verify),
+            args=(keywords, days, target_attr, target_award, date_type, verify, include_misses),
             daemon=True,
         ).start()
 
@@ -423,7 +467,8 @@ class PCCScraperApp(tb.Window):
         parts = [p for p in (target_attr, target_award) if p and p != "不限"]
         return "".join(parts) if parts else "全部條件"
 
-    def run_scrape_thread(self, keywords, days, target_attr, target_award, date_type, verify):
+    def run_scrape_thread(self, keywords, days, target_attr, target_award, date_type, verify,
+                          include_misses=False):
         try:
             if date_type == core.DATE_TYPE_RANGE:
                 days = core.clamp_date_range_days(days, log=self.log)
@@ -454,7 +499,9 @@ class PCCScraperApp(tb.Window):
             self.log(f"📦 掃描完畢，共 {len(tenders_list)} 筆不重複標案（其中 {hits} 筆命中關鍵字）。")
 
             if verify and tenders_list:
-                targets = core.select_rows_for_enrichment(tenders_list, target_attr, target_award)
+                targets = core.select_rows_for_enrichment(
+                    tenders_list, target_attr, target_award,
+                    require_keyword_hit=not include_misses)
 
                 def _on_progress(done, total):
                     if done % max(1, total // 50) == 0 or done == total:
@@ -474,8 +521,15 @@ class PCCScraperApp(tb.Window):
             core.finalize_keywords(tenders_list)
 
             self.tenders_all = tenders_list
-            self.tenders_matched = core.filter_tenders(tenders_list, target_attr, target_award)
+            self.tenders_qualified = core.filter_tenders(tenders_list, target_attr, target_award)
+            self.tenders_keyword_hits = core.filter_tenders(
+                tenders_list, target_attr, target_award, require_keyword_hit=True)
+            self.tenders_matched = (self.tenders_qualified if include_misses
+                                    else self.tenders_keyword_hits)
             self.tenders_by_pk = {t["pk"]: t for t in tenders_list}
+
+            self.log(f"🎯 符合【{target_attr} + {target_award}】共 {len(self.tenders_qualified)} 筆，"
+                     f"其中命中關鍵字 {len(self.tenders_keyword_hits)} 筆。")
 
             self._post("completed")
 
@@ -491,7 +545,7 @@ class PCCScraperApp(tb.Window):
         self.status_badge.configure(text="搜尋完成", bootstyle="inverse-success")
         self.progressbar.configure(value=100)
 
-        self.notebook.tab(0, text=f" 🏆 精選：{self.active_filter_label} ({len(self.tenders_matched)} 筆) ")
+        self._apply_matched_dataset()
         self.notebook.tab(1, text=f" 📋 所有搜尋標案 ({len(self.tenders_all)} 筆) ")
 
         self.filter_treeview(self.tree_matched, "", is_matched=True)
@@ -499,11 +553,13 @@ class PCCScraperApp(tb.Window):
 
         self._append_log(
             f"🎉 搜尋全部完成！共撈取 {len(self.tenders_all)} 筆不重複標案，"
-            f"其中符合篩選條件共 {len(self.tenders_matched)} 筆。"
+            f"符合篩選條件 {len(self.tenders_qualified)} 筆，"
+            f"其中命中關鍵字 {len(self.tenders_keyword_hits)} 筆。"
         )
         self.bottom_status.configure(
-            text=f"完成！共找到 {len(self.tenders_all)} 筆標案"
-                 f"（符合條件: {len(self.tenders_matched)} 筆）。提示：點擊任一欄位標題可排序。"
+            text=f"完成！共找到 {len(self.tenders_all)} 筆標案（符合條件 {len(self.tenders_qualified)} 筆，"
+                 f"命中關鍵字 {len(self.tenders_keyword_hits)} 筆）。"
+                 f"未命中者可勾選精選分頁的「包含未命中關鍵字」查看。"
         )
         self.auto_export_backup()
 

@@ -195,6 +195,12 @@ def test_scrape_scans_everything_and_only_tags_keywords(window, monkeypatch):
          "決標方式": "最低標 (公開招標)", "決標方式來源": core.AWARD_SOURCE_ESTIMATED,
          "預算金額": "1,737,200 元", "公告日期": "2026/08/13", "截止投標": "2026/08/26",
          "是否為勞務類": "是", "是否為最低標": "是", "詳細連結": "https://example.invalid/9"},
+        # 符合勞務+最低標，但名稱沒命中任何關鍵字 —— 不進精選，但必須留在完整清單
+        {"pk": "PK8", "標案案號": "A8", "標案名稱": "內湖區湖元里115年樓梯間粉刷案",
+         "招標機關": "臺北市內湖區公所", "招標方式": "公開招標", "採購性質": "勞務類",
+         "決標方式": "最低標 (公開招標)", "決標方式來源": core.AWARD_SOURCE_ESTIMATED,
+         "預算金額": "180,000 元", "公告日期": "2026/08/14", "截止投標": "2026/08/27",
+         "是否為勞務類": "是", "是否為最低標": "是", "詳細連結": "https://example.invalid/8"},
     ]
 
     def fake_search(keyword, start, end, **kwargs):
@@ -207,13 +213,55 @@ def test_scrape_scans_everything_and_only_tags_keywords(window, monkeypatch):
                         lambda rows, **kw: {"total": len(rows), "done": len(rows),
                                             "ok": 0, "blocked": False})
 
-    window.run_scrape_thread(["AI", "資訊"], 7, "勞務", "最低標", core.DATE_TYPE_RANGE, True)
+    window.include_misses_var.set(False)
+    window.run_scrape_thread(["人力資源", "資訊"], 7, "勞務", "最低標",
+                             core.DATE_TYPE_RANGE, True)
 
     assert captured["keyword"] == ""
     assert captured["date_type"] == core.DATE_TYPE_RANGE
-    assert [t["標案案號"] for t in window.tenders_all] == ["MY115007"]
-    assert window.tenders_all[0]["命中關鍵字"] == ""
+    # 兩筆都抓進來了，但只有命中關鍵字的那筆進精選
+    assert sorted(t["標案案號"] for t in window.tenders_all) == ["A8", "MY115007"]
+    assert [t["標案案號"] for t in window.tenders_qualified] == ["MY115007", "A8"]
+    assert [t["標案案號"] for t in window.tenders_keyword_hits] == ["MY115007"]
     assert [t["標案案號"] for t in window.tenders_matched] == ["MY115007"]
+
+
+def test_精選_toggle_switches_dataset_and_title(window, monkeypatch):
+    """勾選「包含未命中關鍵字」要能把未命中者叫回來，標題數字同步。"""
+    window.active_filter_label = "勞務最低標"
+    window.tenders_qualified = [dict(t) for t in SAMPLE]
+    window.tenders_keyword_hits = [window.tenders_qualified[0]]
+
+    window.include_misses_var.set(False)
+    window.on_include_misses_toggled()
+    assert [t["標案案號"] for t in window.tenders_matched] == ["A1"]
+    title = window.notebook.tab(0, "text")
+    assert "∩關鍵字" in title and "1 筆" in title and "另 1 筆未命中" in title
+
+    window.include_misses_var.set(True)
+    window.on_include_misses_toggled()
+    assert [t["標案案號"] for t in window.tenders_matched] == ["A1", "A2"]
+    assert "2 筆" in window.notebook.tab(0, "text")
+    assert list(window.tree_matched.get_children()) == ["PK1", "PK2"]
+
+
+def test_精選_toggle_keeps_sort_and_filter(window):
+    """切換資料集後，目前的排序方向與快速篩選文字都不該被清掉。"""
+    window.tenders_qualified = [dict(t) for t in SAMPLE]
+    window.tenders_keyword_hits = [dict(t) for t in SAMPLE]
+
+    window.include_misses_var.set(True)
+    window.on_include_misses_toggled()
+    window.on_sort_column(window.tree_matched, "budget", is_matched=True)
+    assert [t["標案案號"] for t in window.tenders_matched] == ["A2", "A1"]
+
+    window.filter_entry_matched.delete(0, "end")
+    window.filter_entry_matched.insert(0, "機關乙")
+    window.include_misses_var.set(False)
+    window.on_include_misses_toggled()
+
+    assert [t["標案案號"] for t in window.tenders_matched] == ["A2", "A1"]
+    assert list(window.tree_matched.get_children()) == ["PK2"]
 
 
 def test_rows_without_keyword_hits_are_marked_in_the_table(window):

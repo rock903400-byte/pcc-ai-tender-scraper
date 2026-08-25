@@ -696,3 +696,47 @@ class TestEnrichmentSelection:
         rows = [self._row("a", "公開招標", "勞務類", "2026/08/20")]
         picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
         assert picked[0] is rows[0]
+
+
+class TestKeywordHitFiltering:
+    """
+    全面掃描會撈回整批勞務標案（午餐、粉刷、校外教學…），
+    精選清單要靠「命中關鍵字」這層才有意義；但未命中者只是不進精選，不會被丟掉。
+    """
+
+    @staticmethod
+    def _row(name, hits, cate="勞務類", lowest="是"):
+        return {"標案名稱": name, "命中關鍵字群": list(hits), "採購性質": cate,
+                "是否為最低標": lowest, "決標方式": "最低標", "公告日期": "2026/08/20"}
+
+    def test_default_keeps_rows_without_hits(self):
+        rows = [self._row("內湖區樓梯間粉刷案", [])]
+        assert len(core.filter_tenders(rows, "勞務", "最低標")) == 1
+
+    def test_require_hit_drops_rows_without_hits(self):
+        rows = [self._row("內湖區樓梯間粉刷案", []),
+                self._row("桃園醫院人力資源E指通計畫採購案", ["人力資源", "E指通"])]
+        picked = core.filter_tenders(rows, "勞務", "最低標", require_keyword_hit=True)
+        assert [r["標案名稱"] for r in picked] == ["桃園醫院人力資源E指通計畫採購案"]
+
+    def test_flattened_keyword_string_also_counts(self):
+        """finalize_keywords() 之後只剩字串欄位，一樣要認得。"""
+        row = self._row("智慧路燈維護案", ["維護"])
+        core.finalize_keywords([row])
+        del row["命中關鍵字群"]
+        assert core.has_keyword_hit(row) is True
+        assert len(core.filter_tenders([row], "勞務", "最低標", require_keyword_hit=True)) == 1
+
+    def test_hit_alone_is_not_enough(self):
+        """命中關鍵字但決標方式不符時，仍不該進精選。"""
+        rows = [self._row("市府資訊系統評選案", ["資訊", "系統"], lowest="否")]
+        assert core.filter_tenders(rows, "勞務", "最低標", require_keyword_hit=True) == []
+
+    def test_enrichment_selection_follows_the_same_rule(self):
+        rows = [self._row("內湖區樓梯間粉刷案", []),
+                self._row("智慧路燈維護案", ["維護"])]
+        for row in rows:
+            row["pk"] = row["標案名稱"]
+            row["招標方式"] = "公開招標"
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標", require_keyword_hit=True)
+        assert [r["標案名稱"] for r in picked] == ["智慧路燈維護案"]

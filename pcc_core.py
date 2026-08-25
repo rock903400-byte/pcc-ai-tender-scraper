@@ -583,14 +583,16 @@ def apply_award_method(tender: dict, actual_award: str):
 
 def select_rows_for_enrichment(tenders: list, target_attr: str = "勞務",
                                target_award: str = "最低標",
-                               limit: int = DEFAULT_VERIFY_LIMIT) -> list:
+                               limit: int = DEFAULT_VERIFY_LIMIT,
+                               require_keyword_hit: bool = False) -> list:
     """
     挑出值得連線詳細頁校驗的標案，避免對整批結果發出上千次請求而被防護擋下。
 
     只保留「採購性質符合」且「依招標方式推估後仍可能入選」的標案（例如目標是最低標時，
     招標方式已明確屬於評選／限制性者不必再查），並依公告日期由新到舊取前 limit 筆。
+    require_keyword_hit 與精選清單的定義一致，好讓有限的校驗次數花在使用者真的會看的標案上。
     """
-    candidates = filter_tenders(tenders, target_attr, target_award)
+    candidates = filter_tenders(tenders, target_attr, target_award, require_keyword_hit)
     candidates.sort(key=lambda t: t.get("公告日期", ""), reverse=True)
     if limit and limit > 0:
         return candidates[:limit]
@@ -703,10 +705,23 @@ def finalize_keywords(tenders: list):
         tender["命中關鍵字"] = ", ".join(tender.get("命中關鍵字群", []))
 
 
-def filter_tenders(tenders: list, target_attr: str = "勞務", target_award: str = "最低標") -> list:
-    """依採購性質與決標方式篩選。兩者皆可傳「不限」。"""
+def has_keyword_hit(tender: dict) -> bool:
+    """該標案名稱是否命中任何標記關鍵字（finalize_keywords 前後都適用）。"""
+    return bool(tender.get("命中關鍵字群") or tender.get("命中關鍵字"))
+
+
+def filter_tenders(tenders: list, target_attr: str = "勞務", target_award: str = "最低標",
+                   require_keyword_hit: bool = False) -> list:
+    """
+    依採購性質與決標方式篩選；採購性質與決標方式皆可傳「不限」。
+
+    require_keyword_hit 為 True 時再加上「標案名稱命中關鍵字」這個條件——
+    全面掃描會撈回整批勞務標案（含午餐、粉刷、校外教學等），精選清單需要這一層才有意義。
+    """
     matched = []
     for tender in tenders:
+        if require_keyword_hit and not has_keyword_hit(tender):
+            continue
         attr_ok = target_attr in ("不限", "", None) or target_attr in tender.get("採購性質", "")
         if target_award == "最低標":
             award_ok = tender.get("是否為最低標") == "是"
