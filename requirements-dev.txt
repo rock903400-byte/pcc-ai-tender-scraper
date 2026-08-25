@@ -1,0 +1,8 @@
+# 開發與建置期相依套件
+-r requirements.txt
+
+# 測試
+pytest>=8.0.0
+
+# 打包成 EXE
+pyinstaller>=6.0.0
