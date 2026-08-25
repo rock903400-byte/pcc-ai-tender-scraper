@@ -69,18 +69,45 @@ def to_ad_date(date_str: str) -> str:
     return date_str
 
 
-def determine_award_method(tender_way: str) -> tuple:
+def determine_award_method(tender_way: str, award_field: str = "") -> tuple:
+    """
+    精確判定決標方式（最低標 vs 最有利標/評選）
+    1. 若已有詳細內文欄位，優先依據詳細欄位判定
+    2. 否則依政府採購法法定招標機制判定：
+       - 公開取得報價單或企劃書 -> 最低標 (依採購法第49條取報價單比減價)
+       - 公開招標 -> 最低標 (依採購法第52條第1項第1/2款)
+       - 選擇性招標 -> 最低標
+       - 經公開評選之限制性招標 / 準用最有利標 / 評選 -> 最有利標/評選
+    """
+    if award_field:
+        award_field_clean = award_field.strip()
+        if "最低標" in award_field_clean:
+            return award_field_clean, True
+        elif "最有利標" in award_field_clean or "評選" in award_field_clean:
+            return award_field_clean, False
+
     tender_way = tender_way.strip()
-    if "評選" in tender_way or "最有利標" in tender_way or "企劃書" in tender_way:
+
+    # 1. 評選 / 最有利標
+    if "評選" in tender_way or "最有利標" in tender_way or "評審" in tender_way:
         return "最有利標 / 評選", False
+    
+    # 2. 公開取得（公開取得報價單或企劃書，法定為最低標）
+    elif "公開取得" in tender_way:
+        return "最低標 (公開取得)", True
+    
+    # 3. 公開招標
     elif "公開招標" in tender_way:
         return "最低標 (公開招標)", True
-    elif "公開取得" in tender_way:
-        return "最低標 (公開取得報價單)", True
+    
+    # 4. 選擇性招標
     elif "選擇性招標" in tender_way:
-        return "最低標 / 選擇性招標", True
+        return "最低標 (選擇性招標)", True
+    
+    # 5. 限制性招標
     elif "限制性招標" in tender_way:
         return "限制性招標", False
+
     return tender_way or "未標明", ("最低標" in tender_way)
 
 
@@ -297,8 +324,8 @@ class PCCScraperApp(tb.Window):
         tree.column("org", width=160, anchor="w")
         tree.column("title", width=340, anchor="w")
         tree.column("budget", width=110, anchor="e")
-        tree.column("award", width=120, anchor="center")
-        tree.column("way", width=140, anchor="w")
+        tree.column("award", width=130, anchor="center")
+        tree.column("way", width=160, anchor="w")
         tree.column("deadline", width=95, anchor="center")
         tree.column("keyword", width=100, anchor="center")
 
@@ -432,7 +459,7 @@ class PCCScraperApp(tb.Window):
                     "tenderName": kw,
                     "tenderId": "",
                     "tenderType": "TENDER_DECLARATION",
-                    "tenderWay": "",  # 不限招標方式（包含公開取得、公開招標、法人補助等）
+                    "tenderWay": "",  # 不限招標方式（涵蓋公開取得、公開招標、法人補助等）
                     "dateType": "isSpdt",
                     "tenderStartDate": start_roc,
                     "tenderEndDate": end_roc,
