@@ -34,3 +34,9 @@ def paged_html():
 def detail_html():
     """標案詳細頁（決標方式為「最低標」）。"""
     return load_fixture("detail.html")
+
+
+@pytest.fixture(scope="session")
+def captcha_html():
+    """詳細頁被頻率防護擋下時回傳的「驗證碼檢核」頁。"""
+    return load_fixture("validate_captcha.html")

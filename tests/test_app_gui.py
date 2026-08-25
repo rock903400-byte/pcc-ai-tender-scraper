@@ -166,3 +166,58 @@ def test_log_from_worker_thread_reaches_widget(window):
 def test_tab_label_reflects_active_filter(attr, award, expected):
     """分頁標題不可再寫死「勞務最低標」。"""
     assert gui.PCCScraperApp._describe_filter(attr, award) == expected
+
+
+# ==================== 全面掃描與日期模式 ====================
+
+def test_days_combo_follows_date_mode(window):
+    """等標期內模式下站方會忽略日期，查詢天數必須停用以免誤導使用者。"""
+    window.date_mode_combo.set(f"{core.DATE_MODE_SPDT} (現正招標中)")
+    window.on_date_mode_changed()
+    assert str(window.days_combo.cget("state")) == "disabled"
+    assert window.selected_date_type() == core.DATE_TYPE_SPDT
+
+    window.date_mode_combo.set(core.DATE_MODE_RANGE)
+    window.on_date_mode_changed()
+    assert str(window.days_combo.cget("state")) == "readonly"
+    assert window.selected_date_type() == core.DATE_TYPE_RANGE
+
+
+def test_scrape_scans_everything_and_only_tags_keywords(window, monkeypatch):
+    """
+    迴歸測試：名稱不含任何關鍵字的標案（本專案的漏抓案例）
+    必須照樣被抓進來，只是「命中關鍵字」為空。
+    """
+    captured = {}
+    scanned = [
+        {"pk": "PK9", "標案案號": "MY115007", "標案名稱": "桃園醫院人力資源E指通計畫採購案",
+         "招標機關": "衛生福利部桃園醫院", "招標方式": "公開招標", "採購性質": "勞務類",
+         "決標方式": "最低標 (公開招標)", "決標方式來源": core.AWARD_SOURCE_ESTIMATED,
+         "預算金額": "1,737,200 元", "公告日期": "2026/08/13", "截止投標": "2026/08/26",
+         "是否為勞務類": "是", "是否為最低標": "是", "詳細連結": "https://example.invalid/9"},
+    ]
+
+    def fake_search(keyword, start, end, **kwargs):
+        captured["keyword"] = keyword
+        captured.update(kwargs)
+        return [dict(row) for row in scanned]
+
+    monkeypatch.setattr(core, "search_pcc", fake_search)
+    monkeypatch.setattr(core, "enrich_actual_award_methods",
+                        lambda rows, **kw: {"total": len(rows), "done": len(rows),
+                                            "ok": 0, "blocked": False})
+
+    window.run_scrape_thread(["AI", "資訊"], 7, "勞務", "最低標", core.DATE_TYPE_RANGE, True)
+
+    assert captured["keyword"] == ""
+    assert captured["date_type"] == core.DATE_TYPE_RANGE
+    assert [t["標案案號"] for t in window.tenders_all] == ["MY115007"]
+    assert window.tenders_all[0]["命中關鍵字"] == ""
+    assert [t["標案案號"] for t in window.tenders_matched] == ["MY115007"]
+
+
+def test_rows_without_keyword_hits_are_marked_in_the_table(window):
+    window.tenders_all[0]["命中關鍵字"] = ""
+    window.filter_treeview(window.tree_all, "", is_matched=False)
+    values = window.tree_all.item("PK1", "values")
+    assert values[-1] == "—"

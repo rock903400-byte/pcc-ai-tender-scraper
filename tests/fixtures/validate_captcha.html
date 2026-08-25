@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head><meta charset="utf-8"><title>政府電子採購網</title></head>
+<body>
+<!--
+  詳細頁頻率防護頁的精簡樣本（取自 searchTenderDetail 連續請求後的實際回應）。
+  這頁沒有搜尋頁那組防護字樣，只有「驗證碼檢核」與撲克牌題目，
+  舊版 is_captcha_page() 認不出來，導致決標方式校驗靜默退回推估值。
+-->
+<div class="listImage"><img src="/tps/images/write.jpg" alt="驗證碼檢核">驗證碼檢核</div>
+<span>為預防惡意程式針對本系統進行大量查詢致影響系統服務品質，並確保資訊安全，請於B區挑選與A區相同之撲克牌後送出。</span>
+<form id="validateForm" name="validateForm" action="/tps/validate/check" method="post">
+  <input type="hidden" id="url" name="url" value="/tps/QueryTender/query/searchTenderDetail">
+  <input type="submit" value="送出">
+</form>
+</body>
+</html>

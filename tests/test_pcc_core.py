@@ -375,24 +375,59 @@ class TestDetailPage:
         rows = core.parse_tender_rows(search_html, "AI")
         assert all(r["決標方式來源"] == core.AWARD_SOURCE_ESTIMATED for r in rows)
 
-        monkeypatch.setattr(core, "fetch_actual_award_method",
-                            lambda pk: "最低標" if pk == rows[0]["pk"] else "")
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status",
+                            lambda pk: ("最低標", "ok") if pk == rows[0]["pk"] else ("", "error"))
         core.enrich_actual_award_methods(rows, max_workers=2)
 
         assert rows[0]["決標方式來源"] == core.AWARD_SOURCE_OFFICIAL
         assert all(r["決標方式來源"] == core.AWARD_SOURCE_ESTIMATED for r in rows[1:])
 
     def test_enrich_reports_failures(self, monkeypatch):
-        monkeypatch.setattr(core, "fetch_actual_award_method", lambda pk: "" if pk == "b" else "最低標")
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status",
+                            lambda pk: ("", "error") if pk == "b" else ("最低標", "ok"))
         tenders = [{"pk": "a", "招標方式": "公開招標", "是否為勞務類": "是"},
                    {"pk": "b", "招標方式": "公開招標", "是否為勞務類": "是"}]
         messages = []
-        ok = core.enrich_actual_award_methods(tenders, max_workers=2, log=messages.append)
-        assert ok == 1
+        stats = core.enrich_actual_award_methods(tenders, max_workers=2, log=messages.append)
+        assert stats == {"total": 2, "done": 2, "ok": 1, "blocked": False}
         assert any("1 筆" in m and "無法取得" in m for m in messages)
 
+    def test_enrich_stops_when_blocked_by_captcha(self, monkeypatch):
+        """
+        站方連續回「驗證碼檢核」頁時要提前收手並明講，
+        不能一路撞牆後讓整批資料靜默停在推估值。
+        """
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("", "blocked"))
+        tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是",
+                    "決標方式來源": core.AWARD_SOURCE_ESTIMATED}
+                   for i in range(20)]
+        messages = []
+        stats = core.enrich_actual_award_methods(tenders, max_workers=1, log=messages.append)
+
+        assert stats["blocked"] is True
+        assert stats["ok"] == 0
+        assert stats["done"] == len(tenders)
+        assert all(t["決標方式來源"] == core.AWARD_SOURCE_ESTIMATED for t in tenders)
+        assert any("驗證碼防護" in m for m in messages)
+
+    def test_enrich_resets_streak_on_success(self, monkeypatch):
+        """零星被擋不算數，只有連續被擋才代表真的被防護鎖住。"""
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(
+            core, "fetch_award_method_status",
+            lambda pk: ("", "blocked") if int(pk) % 2 else ("最低標", "ok"))
+        tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"}
+                   for i in range(20)]
+        stats = core.enrich_actual_award_methods(tenders, max_workers=1)
+        assert stats["blocked"] is False
+        assert stats["ok"] == 10
+
     def test_enrich_reports_progress_for_every_item(self, monkeypatch):
-        monkeypatch.setattr(core, "fetch_actual_award_method", lambda pk: "最低標")
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
         tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"} for i in range(10)]
         seen = []
         core.enrich_actual_award_methods(tenders, max_workers=4,
@@ -496,7 +531,168 @@ class TestCaptchaDetection:
     @pytest.mark.parametrize("html, expected", [
         ("請輸入圖形驗證碼", True),
         ("<p>請輸入驗證碼</p>", True),
+        ("<div>驗證碼檢核</div>", True),
+        ('<form id="validateForm" action="/tps/validate/check"></form>', True),
         ("<table>正常結果</table>", False),
     ])
     def test_is_captcha_page(self, html, expected):
         assert core.is_captcha_page(html) is expected
+
+    def test_detail_page_captcha_is_recognised(self, captcha_html):
+        """詳細頁的防護頁沒有「圖形驗證碼」字樣，仍必須被認出來。"""
+        assert "圖形驗證碼" not in captcha_html
+        assert core.is_captcha_page(captcha_html) is True
+
+    def test_blocked_detail_page_reports_blocked_status(self, monkeypatch, captcha_html):
+        monkeypatch.setattr(core, "http_get", lambda url, **kw: captcha_html)
+        assert core.fetch_award_method_status("PK") == ("", "blocked")
+        assert core.fetch_actual_award_method("PK") == ""
+
+    def test_detail_page_status_ok(self, monkeypatch, detail_html):
+        monkeypatch.setattr(core, "http_get", lambda url, **kw: detail_html)
+        assert core.fetch_award_method_status("PK") == ("最低標", "ok")
+
+
+# ==================== 查詢參數：日期模式與全面掃描 ====================
+
+class TestSearchForm:
+    """
+    站方的兩種日期模式行為完全不同：
+      isSpdt（等標期內）會忽略日期區間；isDate（公告日期區間）只吃西元日期，
+      送民國日期一律回 0 筆。這裡把這兩件事釘住。
+    """
+
+    def test_range_mode_sends_ad_dates(self):
+        form = core.build_search_form("AI", "115/08/01", "115/08/25",
+                                      date_type=core.DATE_TYPE_RANGE)
+        assert form["dateType"] == "isDate"
+        assert form["tenderStartDate"] == "2026/08/01"
+        assert form["tenderEndDate"] == "2026/08/25"
+
+    def test_ad_dates_pass_through_unchanged(self):
+        form = core.build_search_form("AI", "2026/08/01", "2026/08/25",
+                                      date_type=core.DATE_TYPE_RANGE)
+        assert form["tenderStartDate"] == "2026/08/01"
+
+    def test_default_mode_is_bidding_period(self):
+        form = core.build_search_form("AI", "2026/08/01", "2026/08/25")
+        assert form["dateType"] == core.DATE_TYPE_SPDT
+
+    def test_empty_keyword_scans_everything(self):
+        form = core.build_search_form("", "2026/08/01", "2026/08/25",
+                                      core.PROCTRG_CATE["勞務"])
+        assert form["tenderName"] == ""
+        assert form["radProctrgCate"] == "RAD_PROCTRG_CATE_3"
+
+    @pytest.mark.parametrize("days, expected", [(7, 7), (186, 186), (365, core.MAX_RANGE_DAYS)])
+    def test_range_days_are_clamped(self, days, expected):
+        messages = []
+        assert core.clamp_date_range_days(days, log=messages.append) == expected
+        assert bool(messages) is (expected != days)
+
+
+class TestFullScan:
+    def test_date_type_is_forwarded(self, monkeypatch, search_html):
+        captured = {}
+
+        def fake_post(url, data, **kwargs):
+            captured.update(data)
+            return search_html
+
+        monkeypatch.setattr(core, "http_post", fake_post)
+        core.search_pcc("", "2026/08/01", "2026/08/25",
+                        date_type=core.DATE_TYPE_RANGE, polite_delay=0)
+        assert captured["dateType"] == "isDate"
+        assert captured["tenderName"] == ""
+
+    def test_truncation_is_reported_not_silent(self, monkeypatch, paged_html, search_html):
+        """頁數超過上限時必須明講，不能像以前那樣靜默截斷。"""
+        monkeypatch.setattr(core, "http_post",
+                            lambda url, data, **kw: paged_html if "d-49738-p" not in data else search_html)
+        messages = []
+        core.search_pcc("", "2026/08/01", "2026/08/25", max_pages=2,
+                        log=messages.append, polite_delay=0)
+        assert any("頁數超過上限" in m and "未取回" in m for m in messages)
+
+    def test_no_truncation_warning_within_limit(self, monkeypatch, paged_html, search_html):
+        monkeypatch.setattr(core, "http_post",
+                            lambda url, data, **kw: paged_html if "d-49738-p" not in data else search_html)
+        messages = []
+        core.search_pcc("", "2026/08/01", "2026/08/25", log=messages.append, polite_delay=0)
+        assert not any("頁數超過上限" in m for m in messages)
+
+    def test_page_progress_is_reported(self, monkeypatch, paged_html, search_html):
+        monkeypatch.setattr(core, "http_post",
+                            lambda url, data, **kw: paged_html if "d-49738-p" not in data else search_html)
+        seen = []
+        core.search_pcc("", "2026/08/01", "2026/08/25", polite_delay=0,
+                        progress_cb=lambda done, total: seen.append((done, total)))
+        assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+class TestKeywordTagging:
+    """關鍵字只標記、不篩選——這正是本次漏抓案例要守住的行為。"""
+
+    MISSED = {"標案名稱": "桃園醫院人力資源E指通計畫採購案"}
+
+    def test_tags_hit_keywords(self):
+        rows = [dict(self.MISSED)]
+        core.tag_keywords(rows, ["人力資源", "AI"])
+        assert rows[0]["命中關鍵字群"] == ["人力資源"]
+
+    def test_keeps_rows_without_any_hit(self):
+        rows = [dict(self.MISSED)]
+        core.tag_keywords(rows, ["AI", "資訊", "系統"])
+        assert rows[0]["命中關鍵字群"] == []
+        core.finalize_keywords(rows)
+        assert rows[0]["命中關鍵字"] == ""
+
+    def test_matching_is_case_insensitive(self):
+        rows = [{"標案名稱": "校園 app 維運服務案"}]
+        core.tag_keywords(rows, ["APP"])
+        assert rows[0]["命中關鍵字群"] == ["APP"]
+
+    def test_blank_keywords_are_ignored(self):
+        rows = [dict(self.MISSED)]
+        core.tag_keywords(rows, ["", "   ", "人力資源"])
+        assert rows[0]["命中關鍵字群"] == ["人力資源"]
+
+
+class TestEnrichmentSelection:
+    """只校驗有機會入選的標案，才不會用上千次請求去撞驗證碼防護。"""
+
+    @staticmethod
+    def _row(pk, way, cate, pub):
+        rows = core.parse_tender_rows("", "")  # 保持與正式流程相同的欄位語意
+        assert rows == []
+        desc, is_lowest = core.determine_award_method(way)
+        return {
+            "pk": pk, "標案案號": pk, "招標方式": way, "採購性質": cate, "公告日期": pub,
+            "決標方式": desc, "決標方式來源": core.AWARD_SOURCE_ESTIMATED,
+            "是否為勞務類": "是" if "勞務" in cate else "否",
+            "是否為最低標": "是" if is_lowest else "否",
+        }
+
+    def test_skips_rows_that_cannot_qualify(self):
+        rows = [
+            self._row("a", "公開招標", "勞務類", "2026/08/20"),
+            self._row("b", "經公開評選或公開徵求之限制性招標", "勞務類", "2026/08/21"),
+            self._row("c", "公開招標", "工程類", "2026/08/22"),
+        ]
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
+        assert [r["pk"] for r in picked] == ["a"]
+
+    def test_newest_first_and_limited(self):
+        rows = [self._row(str(i), "公開招標", "勞務類", f"2026/08/{i:02d}") for i in range(1, 11)]
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標", limit=3)
+        assert [r["公告日期"] for r in picked] == ["2026/08/10", "2026/08/09", "2026/08/08"]
+
+    def test_zero_limit_means_unlimited(self):
+        rows = [self._row(str(i), "公開招標", "勞務類", "2026/08/20") for i in range(5)]
+        assert len(core.select_rows_for_enrichment(rows, "勞務", "最低標", limit=0)) == 5
+
+    def test_selection_shares_the_same_row_objects(self):
+        """挑出來的是同一批 dict，校驗結果才會回寫到原始清單。"""
+        rows = [self._row("a", "公開招標", "勞務類", "2026/08/20")]
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
+        assert picked[0] is rows[0]

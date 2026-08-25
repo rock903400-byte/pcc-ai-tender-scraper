@@ -9,6 +9,7 @@ app.py (GUI) 與 crawler.py (CLI) 共用本模組，確保分頁、重試、驗�
 import concurrent.futures
 import csv
 import math
+import random
 import re
 import socket
 import sys
@@ -50,8 +51,33 @@ PROCTRG_CATE = {
 
 PAGE_SIZE = 50
 
+# 查詢的日期模式。
+#   isSpdt：等標期內（現正可投標）。站方在此模式下【完全忽略】日期區間參數。
+#   isDate：公告日期區間。此模式下 tenderStartDate / tenderEndDate 必須送【西元】日期，
+#           送民國日期會回 0 筆。
+DATE_TYPE_SPDT = "isSpdt"
+DATE_TYPE_RANGE = "isDate"
+
+DATE_MODE_SPDT = "等標期內"
+DATE_MODE_RANGE = "公告日期區間"
+DATE_MODES = {
+    DATE_MODE_SPDT: DATE_TYPE_SPDT,
+    DATE_MODE_RANGE: DATE_TYPE_RANGE,
+}
+
+# 未登入使用者可查詢的公告日期區間上限（取自站方 basicTenderSearch() 的檢核）
+MAX_RANGE_DAYS = 186
+
+# 翻頁上限（50 筆/頁）。全面掃描的實測量：勞務標案 7 天約 1,600 筆 / 32 頁、
+# 14 天約 2,900 筆 / 58 頁、30 天約 5,600 筆 / 112 頁，故上限訂在 120 頁（6,000 筆）。
+DEFAULT_MAX_PAGES = 120
+
+# 詳細頁校驗的預設筆數上限與節流設定
+DEFAULT_VERIFY_LIMIT = 300
+DETAIL_DELAY_RANGE = (0.3, 0.6)
+CAPTCHA_STREAK_LIMIT = 5
+
 # 對政府伺服器的禮貌間隔（秒）
-KEYWORD_DELAY = 0.6
 PAGE_DELAY = 0.8
 
 # 決標方式的資料來源，讓使用者一眼看出哪些列只是推估值
@@ -173,9 +199,21 @@ def http_get(url: str, max_retries: int = 2, timeout: int = 12) -> str:
     raise last_err
 
 
+# 站方頻率防護頁的特徵字串。搜尋頁是圖形驗證碼，詳細頁則是「撲克牌」驗證碼檢核頁
+# （含 <form id="validateForm" action="/tps/validate/check">），兩者都要認得。
+CAPTCHA_MARKERS = (
+    "圖形驗證碼",
+    "請輸入驗證碼",
+    "驗證碼檢核",
+    "撲克牌",
+    'id="validateForm"',
+    "/tps/validate/check",
+)
+
+
 def is_captcha_page(html_doc: str) -> bool:
     """判斷回應是否為頻率防護的驗證碼頁。"""
-    return "圖形驗證碼" in html_doc or "請輸入驗證碼" in html_doc
+    return any(marker in html_doc for marker in CAPTCHA_MARKERS)
 
 
 # ==================== HTML 解析 ====================
@@ -390,8 +428,14 @@ def parse_page_param(html_doc: str):
     return match.group(1) if match else None
 
 
-def build_search_form(keyword: str, start_roc: str, end_roc: str, proctrg_cate: str = None) -> dict:
-    """組出搜尋表單參數。proctrg_cate 為 None 代表不限採購性質。"""
+def build_search_form(keyword: str, start_date: str, end_date: str, proctrg_cate: str = None,
+                      date_type: str = DATE_TYPE_SPDT) -> dict:
+    """
+    組出搜尋表單參數。
+
+    keyword 傳空字串代表不限標案名稱（全面掃描）；proctrg_cate 為 None 代表不限採購性質。
+    日期一律正規化為西元：isDate 模式下站方只接受西元日期，isSpdt 模式則會忽略日期。
+    """
     form = {
         "pageSize": str(PAGE_SIZE),
         "firstSearch": "true",
@@ -400,29 +444,40 @@ def build_search_form(keyword: str, start_roc: str, end_roc: str, proctrg_cate: 
         "isLogIn": "N",
         "orgName": "",
         "orgId": "",
-        "tenderName": keyword,
+        "tenderName": keyword or "",
         "tenderId": "",
         "tenderType": "TENDER_DECLARATION",
         "tenderWay": "",
-        "dateType": "isSpdt",
-        "tenderStartDate": start_roc,
-        "tenderEndDate": end_roc,
+        "dateType": date_type,
+        "tenderStartDate": to_ad_date(start_date),
+        "tenderEndDate": to_ad_date(end_date),
     }
     if proctrg_cate:
         form["radProctrgCate"] = proctrg_cate
     return form
 
 
-def search_pcc(keyword: str, start_roc: str, end_roc: str, proctrg_cate: str = None,
-               max_pages: int = 20, log=None, polite_delay: float = PAGE_DELAY) -> list:
-    """
-    以關鍵字與日期區間搜尋標案，並自動走訪所有分頁。
+def clamp_date_range_days(days: int, log=None) -> int:
+    """公告日期區間對未登入使用者有 186 天上限，超過時夾住並示警。"""
+    if days <= MAX_RANGE_DAYS:
+        return days
+    if callable(log):
+        log(f"  [!] 公告日期區間最多 {MAX_RANGE_DAYS} 天（未登入限制），已由 {days} 天調整為 {MAX_RANGE_DAYS} 天。")
+    return MAX_RANGE_DAYS
 
-    log 為選用的單參數回呼（CLI 傳 print，GUI 傳執行緒安全的 log）。
+
+def search_pcc(keyword: str, start_date: str, end_date: str, proctrg_cate: str = None,
+               max_pages: int = DEFAULT_MAX_PAGES, log=None, polite_delay: float = PAGE_DELAY,
+               date_type: str = DATE_TYPE_SPDT, progress_cb=None) -> list:
+    """
+    搜尋標案並自動走訪所有分頁。keyword 傳空字串即為該條件下的全面掃描。
+
+    log 為選用的單參數回呼（CLI 傳 print，GUI 傳執行緒安全的 log）；
+    progress_cb(done_pages, total_pages) 為選用的翻頁進度回呼。
     """
     emit = log if callable(log) else (lambda _msg: None)
 
-    form = build_search_form(keyword, start_roc, end_roc, proctrg_cate)
+    form = build_search_form(keyword, start_date, end_date, proctrg_cate, date_type)
     try:
         html_doc = http_post(BASIC_SEARCH_URL, form)
     except Exception as e:
@@ -439,15 +494,25 @@ def search_pcc(keyword: str, start_roc: str, end_roc: str, proctrg_cate: str = N
         emit(f"  [!] {warning}")
 
     total_records = parse_total_records(html_doc)
-    total_pages = min(parse_total_pages(html_doc), max_pages)
+    available_pages = parse_total_pages(html_doc)
+    total_pages = min(available_pages, max_pages)
     page_param = parse_page_param(html_doc)
 
     results = parse_tender_rows(html_doc, keyword, col_index)
+    label = f"關鍵字【{keyword}】" if keyword else "全面掃描"
 
     if total_records is not None:
-        emit(f"  [+] 關鍵字【{keyword}】共 {total_records} 筆 / {total_pages} 頁，開始讀取...")
+        emit(f"  [+] {label}共 {total_records} 筆 / {available_pages} 頁，開始讀取...")
     else:
-        emit(f"  [+] 關鍵字【{keyword}】第 1 頁取得 {len(results)} 筆...")
+        emit(f"  [+] {label}第 1 頁取得 {len(results)} 筆...")
+
+    if available_pages > total_pages:
+        skipped = (total_records - total_pages * PAGE_SIZE) if total_records else "未知"
+        emit(f"  [!] 頁數超過上限（{available_pages} > {max_pages}），僅取回前 {total_pages} 頁，"
+             f"約 {skipped} 筆未取回。可調高 max_pages 或縮小查詢範圍。")
+
+    if progress_cb:
+        progress_cb(1, total_pages)
 
     if total_pages > 1 and not page_param:
         emit("  [!] 找不到分頁參數，僅能取得第 1 頁（網站可能已改版）。")
@@ -463,23 +528,33 @@ def search_pcc(keyword: str, start_roc: str, end_roc: str, proctrg_cate: str = N
             emit(f"    第 {page_idx} 頁抓取失敗: {e}")
             continue
         if is_captcha_page(page_html):
-            emit(f"    第 {page_idx} 頁觸發驗證碼，停止翻頁。")
+            emit(f"    第 {page_idx} 頁觸發驗證碼，停止翻頁（已取得 {len(results)} 筆）。")
             break
         results.extend(parse_tender_rows(page_html, keyword, col_index))
+        if progress_cb:
+            progress_cb(page_idx, total_pages)
 
     return results
 
 
 # ==================== 詳細頁決標方式校驗 ====================
 
-def fetch_actual_award_method(pk: str) -> str:
-    """連線官方詳細頁，萃取真實的「決標方式」欄位值。"""
+def fetch_award_method_status(pk: str) -> tuple:
+    """
+    連線官方詳細頁萃取「決標方式」，回傳 (欄位值, 狀態)。
+
+    狀態為 "ok"（取得欄位）、"blocked"（被站方驗證碼防護擋下）或 "error"
+    （連線失敗或頁面無此欄位）。呼叫端要能區分 blocked，才不會一路撞牆。
+    """
     if not pk:
-        return ""
+        return "", "error"
     try:
         html = http_get(f"{DETAIL_URL}?pkPmsMain={pk}")
     except Exception:
-        return ""
+        return "", "error"
+
+    if is_captcha_page(html):
+        return "", "blocked"
 
     for pattern in (r"決標方式\s*</t[hd]>\s*<td[^>]*>(.*?)</td>",
                     r"決標方式.*?</td>\s*<td[^>]*>(.*?)</td>"):
@@ -487,8 +562,13 @@ def fetch_actual_award_method(pk: str) -> str:
         if match:
             val = strip_tags(match.group(1))
             if val:
-                return val
-    return ""
+                return val, "ok"
+    return "", "error"
+
+
+def fetch_actual_award_method(pk: str) -> str:
+    """連線官方詳細頁，萃取真實的「決標方式」欄位值（取不到時回空字串）。"""
+    return fetch_award_method_status(pk)[0]
 
 
 def apply_award_method(tender: dict, actual_award: str):
@@ -501,56 +581,120 @@ def apply_award_method(tender: dict, actual_award: str):
     tender["完全符合目標"] = "符合 (勞務+最低標)" if (is_service and is_lowest) else "其他"
 
 
-def enrich_actual_award_methods(tenders: list, max_workers: int = 6,
-                                progress_cb=None, log=None) -> int:
+def select_rows_for_enrichment(tenders: list, target_attr: str = "勞務",
+                               target_award: str = "最低標",
+                               limit: int = DEFAULT_VERIFY_LIMIT) -> list:
+    """
+    挑出值得連線詳細頁校驗的標案，避免對整批結果發出上千次請求而被防護擋下。
+
+    只保留「採購性質符合」且「依招標方式推估後仍可能入選」的標案（例如目標是最低標時，
+    招標方式已明確屬於評選／限制性者不必再查），並依公告日期由新到舊取前 limit 筆。
+    """
+    candidates = filter_tenders(tenders, target_attr, target_award)
+    candidates.sort(key=lambda t: t.get("公告日期", ""), reverse=True)
+    if limit and limit > 0:
+        return candidates[:limit]
+    return candidates
+
+
+def enrich_actual_award_methods(tenders: list, max_workers: int = 3,
+                                progress_cb=None, log=None) -> dict:
     """
     多執行緒連線官方詳細頁校驗真實決標方式。
 
-    progress_cb(done, total) 為選用回呼；回傳成功校驗的筆數。
+    站方對連續查詢會回「驗證碼檢核」頁，因此這裡刻意降低併發、每次請求前隨機間隔，
+    並在連續 CAPTCHA_STREAK_LIMIT 筆被擋時提前中止（剩餘筆數維持推估值並明確告知）。
+
+    progress_cb(done, total) 為選用回呼；回傳 {"total", "done", "ok", "blocked"}。
     """
     emit = log if callable(log) else (lambda _msg: None)
+    stats = {"total": len(tenders), "done": 0, "ok": 0, "blocked": False}
     if not tenders:
-        return 0
+        return stats
 
     total = len(tenders)
     emit(f"[*] 正在連線官方詳細頁校驗決標方式 (共 {total} 筆標案)...")
 
-    counter = {"done": 0, "ok": 0}
+    counter = {"done": 0, "ok": 0, "streak": 0}
     lock = threading.Lock()
+    stop = threading.Event()
+
+    def _bump():
+        with lock:
+            counter["done"] += 1
+            return counter["done"]
 
     def _fetch_and_update(tender):
-        actual = fetch_actual_award_method(tender.get("pk", ""))
+        if stop.is_set():
+            done = _bump()
+            if progress_cb:
+                progress_cb(done, total)
+            return
+
+        time.sleep(random.uniform(*DETAIL_DELAY_RANGE))
+        actual, status = fetch_award_method_status(tender.get("pk", ""))
         if actual:
             apply_award_method(tender, actual)
+
         with lock:
             counter["done"] += 1
             if actual:
                 counter["ok"] += 1
+            if status == "blocked":
+                counter["streak"] += 1
+                if counter["streak"] >= CAPTCHA_STREAK_LIMIT and not stop.is_set():
+                    stop.set()
+                    emit(f"  [!] 已被網站驗證碼防護擋下（IP 層級冷卻，重開連線階段無效），中止校驗；"
+                         f"剩餘 {total - counter['done']} 筆維持「{AWARD_SOURCE_ESTIMATED}」，"
+                         f"可稍後再試。")
+            else:
+                counter["streak"] = 0
             done = counter["done"]
+
         if progress_cb:
             progress_cb(done, total)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         list(executor.map(_fetch_and_update, tenders))
 
+    stats.update(done=counter["done"], ok=counter["ok"], blocked=stop.is_set())
+
     failed = total - counter["ok"]
-    if failed:
+    if failed and not stop.is_set():
         emit(f"  [!] 有 {failed} 筆標案無法取得詳細頁決標方式，該筆維持依招標方式的推估值。")
-    return counter["ok"]
+    return stats
 
 
 # ==================== 去重與篩選 ====================
 
-def merge_by_tender_id(unique_tenders: dict, rows: list, keyword: str):
-    """以標案案號去重，並累積命中的關鍵字。就地更新 unique_tenders。"""
+def merge_by_tender_id(unique_tenders: dict, rows: list, keyword: str = ""):
+    """
+    以標案案號去重（同一標案的原公告與更正公告會是不同列），就地更新 unique_tenders。
+
+    keyword 為空字串時只去重、不累積關鍵字——全面掃描模式改由 tag_keywords 標記。
+    """
     for tender in rows:
         tid = tender["標案案號"]
         existing = unique_tenders.get(tid)
         if existing is None:
-            tender["命中關鍵字群"] = [keyword]
+            tender["命中關鍵字群"] = [keyword] if keyword else []
             unique_tenders[tid] = tender
-        elif keyword not in existing["命中關鍵字群"]:
+        elif keyword and keyword not in existing["命中關鍵字群"]:
             existing["命中關鍵字群"].append(keyword)
+
+
+def tag_keywords(tenders: list, keywords: list) -> list:
+    """
+    以本地子字串比對標記命中的關鍵字（大小寫不敏感）。
+
+    全面掃描模式下關鍵字只用於標記與快速篩選，沒命中的標案一樣保留——
+    「桃園醫院人力資源E指通計畫採購案」正是不含任何預設關鍵字卻完全符合條件的例子。
+    """
+    normalized = [(k, k.lower()) for k in (keywords or []) if k and k.strip()]
+    for tender in tenders:
+        name = tender.get("標案名稱", "").lower()
+        tender["命中關鍵字群"] = [kw for kw, low in normalized if low in name]
+    return tenders
 
 
 def finalize_keywords(tenders: list):

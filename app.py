@@ -13,7 +13,6 @@ import queue
 import re
 import sys
 import threading
-import time
 import webbrowser
 from datetime import datetime, timedelta
 import tkinter as tk
@@ -108,7 +107,7 @@ class PCCScraperApp(tb.Window):
         kw_frame = tb.Frame(control_card)
         kw_frame.pack(fill=X, pady=(0, 10))
 
-        tb.Label(kw_frame, text="關鍵字群 (空格分隔):",
+        tb.Label(kw_frame, text="標記關鍵字 (空格分隔):",
                  font=("Microsoft JhengHei", 10, "bold")).pack(side=LEFT, padx=(0, 8))
 
         self.kw_entry = tb.Entry(kw_frame, font=("Microsoft JhengHei", 10))
@@ -116,10 +115,24 @@ class PCCScraperApp(tb.Window):
         self.kw_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 10))
 
         tb.Button(kw_frame, text="重設關鍵字", bootstyle="outline-secondary",
-                  command=self.reset_keywords).pack(side=RIGHT)
+                  command=self.reset_keywords).pack(side=RIGHT, padx=(0, 10))
+
+        # 搜尋一律掃全部標案，關鍵字只用於標記與快速篩選，避免關鍵字沒涵蓋到就整筆漏抓
+        self.verify_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(kw_frame, text="深度校驗決標方式", variable=self.verify_var,
+                       bootstyle="round-toggle").pack(side=RIGHT, padx=(0, 15))
 
         filter_row = tb.Frame(control_card)
         filter_row.pack(fill=X)
+
+        tb.Label(filter_row, text="日期模式:").pack(side=LEFT, padx=(0, 5))
+        self.date_mode_combo = tb.Combobox(
+            filter_row,
+            values=[f"{core.DATE_MODE_SPDT} (現正招標中)", core.DATE_MODE_RANGE],
+            width=18, state="readonly")
+        self.date_mode_combo.set(f"{core.DATE_MODE_SPDT} (現正招標中)")
+        self.date_mode_combo.pack(side=LEFT, padx=(0, 15))
+        self.date_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_date_mode_changed())
 
         tb.Label(filter_row, text="查詢天數:").pack(side=LEFT, padx=(0, 5))
         self.days_combo = tb.Combobox(filter_row, values=["1 (今日)", "3", "7", "14", "30", "60"],
@@ -180,12 +193,14 @@ class PCCScraperApp(tb.Window):
         bottom_bar.pack(fill=X, side=BOTTOM)
         self.bottom_status = tb.Label(
             bottom_bar,
-            text="提示：點選表格任一欄位標題即可切換【升冪 ▲ / 降冪 ▼】排序；雙擊任意列開啟標案網址。",
+            text="提示：關鍵字只用於標記（命中關鍵字欄），不影響抓取範圍；點選欄位標題可排序，雙擊任意列開啟標案網址。",
             font=("Microsoft JhengHei", 9),
         )
         self.bottom_status.pack(side=LEFT)
 
+        self.on_date_mode_changed()
         self._append_log("✅ 應用程式初始化完成。請點擊「開始搜尋標案」開始執行。")
+        self._append_log("ℹ️ 搜尋會掃描該條件下的【全部標案】，關鍵字僅用於標記與快速篩選。")
 
     def setup_treeview(self, parent_frame, is_matched: bool):
         top_filter = tb.Frame(parent_frame, padding=(5, 5))
@@ -326,9 +341,20 @@ class PCCScraperApp(tb.Window):
                 t.get("招標方式", ""),
                 t.get("決標方式來源", ""),
                 t.get("截止投標", ""),
-                t.get("命中關鍵字", ""),
+                t.get("命中關鍵字", "") or "—",
             ))
             seq += 1
+
+    def on_date_mode_changed(self):
+        """等標期內模式下站方會忽略日期區間，因此把「查詢天數」停用以免誤導。"""
+        if self.selected_date_type() == core.DATE_TYPE_RANGE:
+            self.days_combo.configure(state="readonly")
+        else:
+            self.days_combo.configure(state="disabled")
+
+    def selected_date_type(self) -> str:
+        label = self.date_mode_combo.get()
+        return core.DATE_TYPE_RANGE if label.startswith(core.DATE_MODE_RANGE) else core.DATE_TYPE_SPDT
 
     def reset_keywords(self):
         self.kw_entry.delete(0, END)
@@ -370,6 +396,8 @@ class PCCScraperApp(tb.Window):
         days = int(days_val) if days_val.isdigit() else 7
         target_attr = self.attr_combo.get()
         target_award = self.award_combo.get()
+        date_type = self.selected_date_type()
+        verify = bool(self.verify_var.get())
 
         self.active_filter_label = self._describe_filter(target_attr, target_award)
 
@@ -385,7 +413,7 @@ class PCCScraperApp(tb.Window):
 
         threading.Thread(
             target=self.run_scrape_thread,
-            args=(keywords, days, target_attr, target_award),
+            args=(keywords, days, target_attr, target_award, date_type, verify),
             daemon=True,
         ).start()
 
@@ -395,40 +423,53 @@ class PCCScraperApp(tb.Window):
         parts = [p for p in (target_attr, target_award) if p and p != "不限"]
         return "".join(parts) if parts else "全部條件"
 
-    def run_scrape_thread(self, keywords, days, target_attr, target_award):
+    def run_scrape_thread(self, keywords, days, target_attr, target_award, date_type, verify):
         try:
+            if date_type == core.DATE_TYPE_RANGE:
+                days = core.clamp_date_range_days(days, log=self.log)
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
-            start_roc = core.to_roc_date(start_date.strftime("%Y/%m/%d"))
-            end_roc = core.to_roc_date(end_date.strftime("%Y/%m/%d"))
+            start_ad = start_date.strftime("%Y/%m/%d")
+            end_ad = end_date.strftime("%Y/%m/%d")
             proctrg_cate = core.PROCTRG_CATE.get(target_attr)
 
-            self.log(f"🚀 開始搜尋：民國 {start_roc} ~ {end_roc} (最近 {days} 天)")
-            self.log(f"🔑 關鍵字共 {len(keywords)} 組: {', '.join(keywords)}")
+            if date_type == core.DATE_TYPE_RANGE:
+                self.log(f"🚀 全面掃描【{target_attr}】標案：公告日期 {start_ad} ~ {end_ad} (最近 {days} 天)")
+            else:
+                self.log(f"🚀 全面掃描【{target_attr}】標案：等標期內（現正招標中，站方會忽略日期區間）")
+            self.log(f"🏷️ 標記關鍵字共 {len(keywords)} 組: {', '.join(keywords)}")
+
+            def _on_page(done_pages, total_pages):
+                self._post("progress", int(done_pages / max(total_pages, 1) * SEARCH_PROGRESS_SHARE))
+
+            rows = core.search_pcc("", start_ad, end_ad, proctrg_cate=proctrg_cate,
+                                   date_type=date_type, log=self.log, progress_cb=_on_page)
 
             unique_tenders = {}
-            total_kws = len(keywords)
-
-            for idx, kw in enumerate(keywords, start=1):
-                if idx > 1:
-                    time.sleep(core.KEYWORD_DELAY)
-                self.log(f"🔍 [{idx}/{total_kws}] 正在搜尋：【{kw}】...")
-                rows = core.search_pcc(kw, start_roc, end_roc,
-                                       proctrg_cate=proctrg_cate, log=self.log)
-                core.merge_by_tender_id(unique_tenders, rows, kw)
-                self._post("progress", int(idx / total_kws * SEARCH_PROGRESS_SHARE))
-
+            core.merge_by_tender_id(unique_tenders, rows, "")
             tenders_list = list(unique_tenders.values())
-            self.log(f"📦 關鍵字搜尋完畢，共 {len(tenders_list)} 筆不重複標案。")
+            core.tag_keywords(tenders_list, keywords)
 
-            if tenders_list:
+            hits = sum(1 for t in tenders_list if t.get("命中關鍵字群"))
+            self.log(f"📦 掃描完畢，共 {len(tenders_list)} 筆不重複標案（其中 {hits} 筆命中關鍵字）。")
+
+            if verify and tenders_list:
+                targets = core.select_rows_for_enrichment(tenders_list, target_attr, target_award)
+
                 def _on_progress(done, total):
                     if done % max(1, total // 50) == 0 or done == total:
                         share = 100 - SEARCH_PROGRESS_SHARE
                         self._post("progress", SEARCH_PROGRESS_SHARE + int(done / total * share))
 
-                self.log(f"⚡ 正在平行連線官方詳細頁，校驗真實決標方式 (共 {len(tenders_list)} 筆)...")
-                core.enrich_actual_award_methods(tenders_list, progress_cb=_on_progress, log=self.log)
+                if targets:
+                    self.log(f"⚡ 從 {len(tenders_list)} 筆中挑出 {len(targets)} 筆候選，"
+                             f"連線官方詳細頁校驗真實決標方式...")
+                    stats = core.enrich_actual_award_methods(targets, progress_cb=_on_progress,
+                                                             log=self.log)
+                    self.log(f"✅ 校驗完成：{stats['ok']}/{stats['total']} 筆取得官方決標方式，"
+                             f"其餘維持「{core.AWARD_SOURCE_ESTIMATED}」。")
+            elif not verify:
+                self.log(f"ℹ️ 已關閉深度校驗，決標方式全部為「{core.AWARD_SOURCE_ESTIMATED}」。")
 
             core.finalize_keywords(tenders_list)
 
