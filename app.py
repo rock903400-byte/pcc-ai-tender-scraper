@@ -44,7 +44,7 @@ BASIC_SEARCH_URL = BASE_URL + "/prkms/tender/common/basic/readTenderBasic"
 BASIC_INDEX_URL = BASE_URL + "/prkms/tender/common/basic/indexTenderBasic"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Content-Type": "application/x-www-form-urlencoded",
@@ -155,7 +155,6 @@ class PCCScraperApp(tb.Window):
         self.geometry("1180x820")
         self.minsize(980, 680)
 
-        # 狀態變數
         self.is_running = False
         self.cancel_requested = False
         self.tenders_all = []
@@ -166,7 +165,6 @@ class PCCScraperApp(tb.Window):
         self.setup_ui()
 
     def setup_ui(self):
-        # 1. 頂部標題與狀態列
         header_frame = tb.Frame(self, bootstyle="light", padding=15)
         header_frame.pack(fill=X)
 
@@ -187,11 +185,9 @@ class PCCScraperApp(tb.Window):
         )
         self.status_badge.pack(side=RIGHT)
 
-        # 2. 控制面板 (Card)
         control_card = tb.Labelframe(self, text=" ⚙️ 搜尋條件設定 ", padding=15, bootstyle="info")
         control_card.pack(fill=X, padx=15, pady=10)
 
-        # 第一列：常用關鍵字快速選擇
         kw_frame = tb.Frame(control_card)
         kw_frame.pack(fill=X, pady=(0, 10))
 
@@ -205,7 +201,6 @@ class PCCScraperApp(tb.Window):
         reset_btn = tb.Button(kw_frame, text="重設關鍵字", bootstyle="outline-secondary", command=lambda: self.reset_keywords(default_kw_str))
         reset_btn.pack(side=RIGHT)
 
-        # 第二列：篩選與天數設定
         filter_row = tb.Frame(control_card)
         filter_row.pack(fill=X)
 
@@ -224,7 +219,6 @@ class PCCScraperApp(tb.Window):
         self.award_combo.set("最低標")
         self.award_combo.pack(side=LEFT, padx=(0, 20))
 
-        # 操作按鈕群
         self.start_btn = tb.Button(filter_row, text="🚀 開始搜尋標案", bootstyle="success", command=self.on_start_scrape)
         self.start_btn.pack(side=RIGHT, padx=5)
 
@@ -234,34 +228,28 @@ class PCCScraperApp(tb.Window):
         open_folder_btn = tb.Button(filter_row, text="📂 開啟輸出資料夾", bootstyle="outline-info", command=self.open_output_dir)
         open_folder_btn.pack(side=RIGHT, padx=5)
 
-        # 3. 進度條與即時日誌
         progress_frame = tb.Frame(self, padding=(15, 0))
         progress_frame.pack(fill=X)
 
         self.progressbar = tb.Progressbar(progress_frame, mode="determinate", bootstyle="info-striped")
         self.progressbar.pack(fill=X, pady=(0, 5))
 
-        # 4. 主要結果區域 (Notebook 分頁)
         self.notebook = tb.Notebook(self, bootstyle="primary")
         self.notebook.pack(fill=BOTH, expand=True, padx=15, pady=10)
 
-        # 分頁 1: 精選勞務最低標
         self.tab_matched = tb.Frame(self.notebook)
         self.notebook.add(self.tab_matched, text=" 🏆 精選：勞務最低標 (0 筆) ")
         self.setup_treeview(self.tab_matched, is_matched=True)
 
-        # 分頁 2: 所有搜尋結果
         self.tab_all = tb.Frame(self.notebook)
         self.notebook.add(self.tab_all, text=" 📋 所有搜尋標案 (0 筆) ")
         self.setup_treeview(self.tab_all, is_matched=False)
 
-        # 分頁 3: 即時日誌
         self.tab_logs = tb.Frame(self.notebook)
         self.notebook.add(self.tab_logs, text=" 📝 執行紀錄 ")
         self.log_text = ScrolledText(self.tab_logs, height=10, font=("Consolas", 9), autohide=True)
         self.log_text.pack(fill=BOTH, expand=True, padx=10, pady=10)
 
-        # 底部狀態列
         bottom_bar = tb.Frame(self, padding=(15, 5), bootstyle="secondary")
         bottom_bar.pack(fill=X, side=BOTTOM)
         self.bottom_status = tb.Label(bottom_bar, text="提示：雙擊表格任意列或點擊右側按鈕即可在瀏覽器開啟標案網址。", font=("Microsoft JhengHei", 9))
@@ -270,7 +258,6 @@ class PCCScraperApp(tb.Window):
         self.log("✅ 應用程式初始化完成。請點擊「開始搜尋標案」開始執行。")
 
     def setup_treeview(self, parent_frame, is_matched: bool):
-        # 搜尋篩選列
         top_filter = tb.Frame(parent_frame, padding=(5, 5))
         top_filter.pack(fill=X)
 
@@ -286,7 +273,6 @@ class PCCScraperApp(tb.Window):
         )
         open_link_btn.pack(side=RIGHT)
 
-        # 表格 Treeview
         columns = ("seq", "pub_date", "org", "title", "budget", "award", "way", "deadline", "keyword")
         tree = tb.Treeview(
             parent_frame,
@@ -316,7 +302,6 @@ class PCCScraperApp(tb.Window):
         tree.column("deadline", width=95, anchor="center")
         tree.column("keyword", width=100, anchor="center")
 
-        # 捲軸
         scrollbar_y = tb.Scrollbar(parent_frame, orient="vertical", command=tree.yview)
         scrollbar_x = tb.Scrollbar(parent_frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
@@ -325,10 +310,7 @@ class PCCScraperApp(tb.Window):
         scrollbar_x.pack(side=BOTTOM, fill=X)
         tree.pack(fill=BOTH, expand=True)
 
-        # 雙擊事件
         tree.bind("<Double-1>", lambda event: self.open_selected_link(tree))
-
-        # 即時過濾綁定
         filter_entry.bind("<KeyRelease>", lambda event: self.filter_treeview(tree, filter_entry.get(), is_matched))
 
         if is_matched:
@@ -351,10 +333,8 @@ class PCCScraperApp(tb.Window):
             messagebox.showinfo("提示", "請先點選欲查看的標案列！")
             return
         item_values = tree.item(selected_item[0], "values")
-        # 標案案號或詳細連結
         tender_name = item_values[3]
         
-        # 從資料中找出對應的連結
         target_url = None
         for t in self.tenders_all:
             if t.get("標案名稱") == tender_name:
@@ -416,11 +396,9 @@ class PCCScraperApp(tb.Window):
         self.status_badge.configure(text="搜尋中...", bootstyle="inverse-warning")
         self.progressbar.configure(value=0)
 
-        # 清空表格
         self.tree_matched.delete(*self.tree_matched.get_children())
         self.tree_all.delete(*self.tree_all.get_children())
 
-        # 啟動背景工作執行緒
         threading.Thread(
             target=self.run_scrape_thread,
             args=(keywords, days, target_attr, target_award),
@@ -443,7 +421,6 @@ class PCCScraperApp(tb.Window):
             for idx, kw in enumerate(keywords, start=1):
                 self.log(f"🔍 [{idx}/{total_kws}] 正在搜尋：【{kw}】...")
                 
-                # 發送請求
                 form_data = {
                     "pageSize": "50",
                     "firstSearch": "true",
@@ -455,7 +432,7 @@ class PCCScraperApp(tb.Window):
                     "tenderName": kw,
                     "tenderId": "",
                     "tenderType": "TENDER_DECLARATION",
-                    "tenderWay": "TENDER_WAY_ALL_DECLARATION",
+                    "tenderWay": "",  # 不限招標方式（包含公開取得、公開招標、法人補助等）
                     "dateType": "isSpdt",
                     "tenderStartDate": start_roc,
                     "tenderEndDate": end_roc,
@@ -485,17 +462,14 @@ class PCCScraperApp(tb.Window):
                 except Exception as e:
                     self.log(f"  ⚠️ 關鍵字【{kw}】搜尋發生例外: {e}")
 
-                # 更新進度條
                 progress = int((idx / total_kws) * 100)
                 self.after(0, self.update_progress, progress)
                 time.sleep(0.6)
 
-            # 整理結果
             self.tenders_all = list(unique_tenders.values())
             for t in self.tenders_all:
                 t["命中關鍵字"] = ", ".join(t.get("命中關鍵字群", []))
 
-            # 篩選符合條件標案
             self.tenders_matched = []
             for t in self.tenders_all:
                 attr_ok = (target_attr == "不限") or (target_attr in t.get("採購性質", ""))
@@ -519,18 +493,15 @@ class PCCScraperApp(tb.Window):
         self.status_badge.configure(text="搜尋完成", bootstyle="inverse-success")
         self.progressbar.configure(value=100)
 
-        # 更新分頁標題筆數
         self.notebook.tab(0, text=f" 🏆 精選：勞務最低標 ({len(self.tenders_matched)} 筆) ")
         self.notebook.tab(1, text=f" 📋 所有搜尋標案 ({len(self.tenders_all)} 筆) ")
 
-        # 填入表格資料
         self.filter_treeview(self.tree_matched, "", is_matched=True)
         self.filter_treeview(self.tree_all, "", is_matched=False)
 
         self.log(f"🎉 搜尋全部完成！共撈取 {len(self.tenders_all)} 筆不重複標案，其中精選符合【勞務+最低標】共 {len(self.tenders_matched)} 筆。")
         self.bottom_status.configure(text=f"完成！共找到 {len(self.tenders_all)} 筆標案（精選符合: {len(self.tenders_matched)} 筆）。")
 
-        # 自動先匯出一份 Excel 備份
         self.auto_export_backup()
 
     def auto_export_backup(self):

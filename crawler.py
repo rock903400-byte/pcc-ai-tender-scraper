@@ -57,7 +57,7 @@ BASIC_INDEX_URL = BASE_URL + "/prkms/tender/common/basic/indexTenderBasic"
 DETAIL_URL = BASE_URL + "/tps/QueryTender/query/searchTenderDetail"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Content-Type": "application/x-www-form-urlencoded",
@@ -112,7 +112,7 @@ def parse_total_pages(html_content: str) -> int:
 
 def determine_award_method(tender_way: str) -> tuple:
     """
-    根據政府採購法招標方式與公告內容判定決標機制
+    根據政府採購法招標方式判定決標機制
     - 公開招標 / 公開取得報價單: 預設為 最低標
     - 經公開評選之限制性招標 / 準用最有利標 / 評選: 為 最有利標/評選
     """
@@ -136,20 +136,17 @@ def parse_tender_rows(html_doc: str, keyword: str) -> list:
     rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html_doc, re.DOTALL)
 
     for r in rows:
-        # 尋找 PK 連結
         pk_match = re.search(r'pk=([^&"\'>\s]+)', r)
         if not pk_match:
             continue
         pk = pk_match.group(1)
         detail_link = f"{BASE_URL}/prkms/urlSelector/common/tpam?pk={pk}"
 
-        # 提取經 JS 混淆保護的標案名稱 (Geps3.CNS.pageCode2Img)
         tender_name = ""
         img_match = re.findall(r'pageCode2Img\(["\'](.*?)["\']\)', r)
         if img_match:
             tender_name = img_match[0].strip()
 
-        # 擷取各個 td 儲存格文字
         cells = re.findall(r'<td[^>]*>(.*?)</td>', r, re.DOTALL)
         cleaned_cells = []
         for c in cells:
@@ -160,8 +157,6 @@ def parse_tender_rows(html_doc: str, keyword: str) -> list:
         if len(cleaned_cells) < 8:
             continue
 
-        # 欄位對應順序:
-        # [0]項次, [1]機關名稱, [2]標案案號, [3]傳送次數, [4]招標方式, [5]採購性質, [6]公告日期, [7]截止投標, [8]預算金額
         org_name = cleaned_cells[1]
         tender_id = cleaned_cells[2]
         tender_way = cleaned_cells[4] if len(cleaned_cells) > 4 else ""
@@ -170,14 +165,12 @@ def parse_tender_rows(html_doc: str, keyword: str) -> list:
         deadline = cleaned_cells[7] if len(cleaned_cells) > 7 else ""
         budget = cleaned_cells[8] if len(cleaned_cells) > 8 else ""
 
-        # 若未從 JS 抓到名稱，從儲存格嘗試提取
         if not tender_name and len(cleaned_cells) > 3:
             tender_name = cleaned_cells[3]
 
         if not tender_id or not org_name:
             continue
 
-        # 判斷採購性質與決標方式
         is_service = "勞務" in proc_type
         award_method_desc, is_lowest = determine_award_method(tender_way)
 
@@ -215,11 +208,11 @@ def search_pcc(keyword: str, start_date_roc: str, end_date_roc: str, max_pages: 
         "tenderName": keyword,
         "tenderId": "",
         "tenderType": "TENDER_DECLARATION",
-        "tenderWay": "TENDER_WAY_ALL_DECLARATION",
+        "tenderWay": "",  # 空白代表不限招標方式（涵蓋公開取得、公開招標等所有案件）
         "dateType": "isSpdt",
         "tenderStartDate": start_date_roc,
         "tenderEndDate": end_date_roc,
-        "radProctrgCate": "RAD_PROCTRG_CATE_3",  # 優先在搜尋端設定勞務
+        "radProctrgCate": "RAD_PROCTRG_CATE_3",
     }
 
     try:
@@ -270,7 +263,6 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
     print(f"[*] 搜尋關鍵字 ({len(keywords)} 組): {', '.join(keywords)}")
     print("=" * 65)
 
-    # 1. 遍歷關鍵字抓取清單並去重
     unique_tenders = {}
     for kw in keywords:
         print(f"\n[SEARCH] 正在搜尋關鍵字：【{kw}】...")
@@ -296,13 +288,11 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
         print("[INFO] 本次搜尋區間內未發現任何標案。")
         return
 
-    # 2. 篩選完全符合「勞務類」且為「最低標」之標案
     matched_tenders = [
         t for t in tenders_list
         if t.get("是否為勞務類") == "是" and t.get("是否為最低標") == "是"
     ]
 
-    # 3. 終端機即時摘要呈現
     print("\n" + "=" * 65)
     print("[SUMMARY] 執行成果摘要")
     print(f"  • 全部搜尋到標案: {len(tenders_list)} 筆")
@@ -317,11 +307,9 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
             print(f"     招標方式: {m['招標方式']} | 命中關鍵字: {m['命中關鍵字']}")
             print(f"     連結: {m['詳細連結']}\n")
 
-    # 4. 匯出成果報表
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_filename = f"pcc_tenders_{timestamp}"
 
-    # 輸出 Excel
     if EXPORT_EXCEL and HAS_PANDAS:
         excel_path = os.path.join(OUTPUT_DIR, f"{base_filename}.xlsx")
         df_all = pd.DataFrame(tenders_list)
@@ -346,7 +334,6 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
             df_all.to_excel(writer, sheet_name="所有搜尋標案", index=False)
         print(f"[SAVE] Excel 報表已輸出: {os.path.abspath(excel_path)}")
 
-    # 輸出 CSV
     if EXPORT_CSV:
         csv_path = os.path.join(OUTPUT_DIR, f"{base_filename}_勞務最低標.csv")
         export_data = matched_tenders if matched_tenders else tenders_list
@@ -358,7 +345,6 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
                 writer.writerows(export_data)
             print(f"[SAVE] CSV 檔案已輸出: {os.path.abspath(csv_path)}")
 
-    # 輸出 JSON
     if EXPORT_JSON:
         json_path = os.path.join(OUTPUT_DIR, f"{base_filename}.json")
         with open(json_path, "w", encoding="utf-8") as f:
