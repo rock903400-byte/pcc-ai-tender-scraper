@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 政府電子採購網 - AI 與資訊勞務最低標標案爬蟲 GUI 應用程式
-使用 ttkbootstrap 建構現代化桌面介面，支援多執行緒搜尋、官方詳細頁真實決標方式深度校驗、即時進度、表格展示與 Excel 匯出。
+使用 ttkbootstrap 建構現代化桌面介面，支援多執行緒搜尋、官方詳細頁真實決標方式深度校驗、
+表格多欄位智能排序（金額/日期/字串）、即時進度與 Excel 匯出。
 """
 
 import concurrent.futures
@@ -55,6 +56,19 @@ HEADERS = {
 }
 
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+# 表格欄位定義 (id, 預設標題, 寬度, 對齊方式)
+COLUMNS_CONFIG = [
+    ("seq", "#", 40, "center"),
+    ("pub_date", "公告日期", 90, "center"),
+    ("org", "招標機關", 160, "w"),
+    ("title", "標案名稱", 340, "w"),
+    ("budget", "預算金額", 110, "e"),
+    ("award", "決標方式", 140, "center"),
+    ("way", "招標方式", 150, "w"),
+    ("deadline", "截止投標", 95, "center"),
+    ("keyword", "命中關鍵字", 100, "center"),
+]
 
 
 def to_roc_date(date_str: str) -> str:
@@ -198,11 +212,16 @@ class PCCScraperApp(tb.Window):
         self.minsize(980, 680)
 
         self.is_running = False
-        self.cancel_requested = False
         self.tenders_all = []
         self.tenders_matched = []
         self.output_dir = os.path.abspath("output")
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # 排序狀態記錄
+        self.sort_state_matched = {"col": None, "reverse": False}
+        self.sort_state_all = {"col": None, "reverse": False}
+        self.filter_entry_matched = None
+        self.filter_entry_all = None
 
         self.setup_ui()
 
@@ -294,7 +313,11 @@ class PCCScraperApp(tb.Window):
 
         bottom_bar = tb.Frame(self, padding=(15, 5), bootstyle="secondary")
         bottom_bar.pack(fill=X, side=BOTTOM)
-        self.bottom_status = tb.Label(bottom_bar, text="提示：雙擊表格任意列或點擊右側按鈕即可在瀏覽器開啟標案網址。", font=("Microsoft JhengHei", 9))
+        self.bottom_status = tb.Label(
+            bottom_bar,
+            text="提示：點選表格任一欄位標題即可切換【升冪 ▲ / 降冪 ▼】排序；雙擊任意列開啟標案網址。",
+            font=("Microsoft JhengHei", 9)
+        )
         self.bottom_status.pack(side=LEFT)
 
         self.log("✅ 應用程式初始化完成。請點擊「開始搜尋標案」開始執行。")
@@ -307,6 +330,11 @@ class PCCScraperApp(tb.Window):
         filter_entry = tb.Entry(top_filter, width=25)
         filter_entry.pack(side=LEFT, padx=(0, 10))
 
+        if is_matched:
+            self.filter_entry_matched = filter_entry
+        else:
+            self.filter_entry_all = filter_entry
+
         open_link_btn = tb.Button(
             top_filter,
             text="🔗 開啟選取標案網頁",
@@ -315,34 +343,23 @@ class PCCScraperApp(tb.Window):
         )
         open_link_btn.pack(side=RIGHT)
 
-        columns = ("seq", "pub_date", "org", "title", "budget", "award", "way", "deadline", "keyword")
+        col_ids = [c[0] for c in COLUMNS_CONFIG]
         tree = tb.Treeview(
             parent_frame,
-            columns=columns,
+            columns=col_ids,
             show="headings",
             bootstyle="primary",
             selectmode="browse"
         )
-        
-        tree.heading("seq", text="#")
-        tree.heading("pub_date", text="公告日期")
-        tree.heading("org", text="招標機關")
-        tree.heading("title", text="標案名稱")
-        tree.heading("budget", text="預算金額")
-        tree.heading("award", text="決標方式")
-        tree.heading("way", text="招標方式")
-        tree.heading("deadline", text="截止投標")
-        tree.heading("keyword", text="命中關鍵字")
 
-        tree.column("seq", width=40, anchor="center")
-        tree.column("pub_date", width=90, anchor="center")
-        tree.column("org", width=160, anchor="w")
-        tree.column("title", width=340, anchor="w")
-        tree.column("budget", width=110, anchor="e")
-        tree.column("award", width=140, anchor="center")
-        tree.column("way", width=150, anchor="w")
-        tree.column("deadline", width=95, anchor="center")
-        tree.column("keyword", width=100, anchor="center")
+        for col_id, col_name, width, align in COLUMNS_CONFIG:
+            tree.heading(
+                col_id,
+                text=col_name,
+                anchor=align,
+                command=lambda c=col_id: self.on_sort_column(tree, c, is_matched)
+            )
+            tree.column(col_id, width=width, anchor=align)
 
         scrollbar_y = tb.Scrollbar(parent_frame, orient="vertical", command=tree.yview)
         scrollbar_x = tb.Scrollbar(parent_frame, orient="horizontal", command=tree.xview)
@@ -359,6 +376,59 @@ class PCCScraperApp(tb.Window):
             self.tree_matched = tree
         else:
             self.tree_all = tree
+
+    def extract_sort_key(self, item: dict, col_id: str):
+        """型態感知之排序 Key 萃取器"""
+        if col_id == "budget":
+            raw_b = str(item.get("預算金額", ""))
+            digits = re.sub(r"[^\d.]", "", raw_b)
+            return float(digits) if digits else -1.0
+        elif col_id == "pub_date":
+            return str(item.get("公告日期", ""))
+        elif col_id == "deadline":
+            return str(item.get("截止投標", ""))
+        elif col_id == "org":
+            return str(item.get("招標機關", ""))
+        elif col_id == "title":
+            return str(item.get("標案名稱", ""))
+        elif col_id == "award":
+            return str(item.get("決標方式", ""))
+        elif col_id == "way":
+            return str(item.get("招標方式", ""))
+        elif col_id == "keyword":
+            return str(item.get("命中關鍵字", ""))
+        return str(item.get("標案案號", ""))
+
+    def on_sort_column(self, tree, col_id: str, is_matched: bool):
+        """點擊欄頭切換升降冪排序"""
+        state = self.sort_state_matched if is_matched else self.sort_state_all
+        dataset = self.tenders_matched if is_matched else self.tenders_all
+
+        if not dataset:
+            return
+
+        if state["col"] == col_id:
+            state["reverse"] = not state["reverse"]
+        else:
+            state["col"] = col_id
+            # 預算與日期預設先以降冪（最高/最新）呈現，其餘預設升冪
+            state["reverse"] = (col_id in ("budget", "pub_date", "deadline"))
+
+        reverse = state["reverse"]
+        dataset.sort(key=lambda t: self.extract_sort_key(t, col_id), reverse=reverse)
+
+        # 更新欄位標題箭頭
+        indicator = " ▼" if reverse else " ▲"
+        for c_id, c_name, _, _ in COLUMNS_CONFIG:
+            if c_id == col_id:
+                tree.heading(c_id, text=f"{c_name}{indicator}")
+            else:
+                tree.heading(c_id, text=c_name)
+
+        # 重新整理顯示內容（維持目前的篩選框文字）
+        filter_entry = self.filter_entry_matched if is_matched else self.filter_entry_all
+        query = filter_entry.get() if filter_entry else ""
+        self.filter_treeview(tree, query, is_matched)
 
     def reset_keywords(self, default_str):
         self.kw_entry.delete(0, END)
@@ -567,7 +637,7 @@ class PCCScraperApp(tb.Window):
         self.filter_treeview(self.tree_all, "", is_matched=False)
 
         self.log(f"🎉 搜尋全部完成！共撈取 {len(self.tenders_all)} 筆不重複標案，其中精選符合【勞務+最低標】共 {len(self.tenders_matched)} 筆。")
-        self.bottom_status.configure(text=f"完成！共找到 {len(self.tenders_all)} 筆標案（精選符合: {len(self.tenders_matched)} 筆）。")
+        self.bottom_status.configure(text=f"完成！共找到 {len(self.tenders_all)} 筆標案（精選符合: {len(self.tenders_matched)} 筆）。提示：點擊任一欄位標題可排序。")
 
         self.auto_export_backup()
 
