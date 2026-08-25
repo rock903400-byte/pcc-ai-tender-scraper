@@ -2,6 +2,12 @@
 pandas>=2.0.0
 openpyxl>=3.1.0
 
+# 桌面 GUI 介面
+ttkbootstrap>=1.10.0
+
+# 打包工具
+pyinstaller>=6.0.0
+
 # 網路連線與網頁解析（備用）
 requests>=2.31.0
 beautifulsoup4>=4.12.0
