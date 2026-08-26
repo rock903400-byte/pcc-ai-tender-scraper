@@ -392,18 +392,34 @@ class TestDetailPage:
         messages = []
         stats = core.enrich_actual_award_methods(tenders, max_workers=2, log=messages.append)
         assert stats == {"total": 2, "done": 2, "ok": 1, "blocked": False}
-        assert any("1 筆" in m and "無法取得" in m for m in messages)
+        assert any("1 筆" in m and "沒有決標方式欄位" in m for m in messages)
+
+    def test_enrich_distinguishes_blocked_from_missing(self, monkeypatch):
+        """
+        「被驗證碼擋下」稍後重試就拿得到，「詳細頁沒這個欄位」重試幾次都一樣。
+        兩者混為一談會讓使用者不知道還該不該再試。
+        """
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status",
+                            lambda pk: ("", "blocked") if pk == "a" else ("", "error"))
+        tenders = [{"pk": "a", "招標方式": "公開招標", "是否為勞務類": "是"},
+                   {"pk": "b", "招標方式": "公開招標", "是否為勞務類": "是"}]
+        messages = []
+        core.enrich_actual_award_methods(tenders, max_workers=1, log=messages.append)
+
+        assert any("驗證碼防護擋下" in m and "1 筆" in m for m in messages)
+        assert any("沒有決標方式欄位" in m and "1 筆" in m for m in messages)
 
     def test_enrich_stops_when_blocked_by_captcha(self, monkeypatch):
         """
-        站方連續回「驗證碼檢核」頁時要提前收手並明講，
-        不能一路撞牆後讓整批資料靜默停在推估值。
+        站方連續回「驗證碼檢核」頁時要立刻收手並明講，
+        不能一路撞牆後讓整批資料靜默停在推估值，也不該為此拖長每次搜尋。
         """
         monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
         monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("", "blocked"))
         tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是",
                     "決標方式來源": core.AWARD_SOURCE_ESTIMATED}
-                   for i in range(20)]
+                   for i in range(30)]
         messages = []
         stats = core.enrich_actual_award_methods(tenders, max_workers=1, log=messages.append)
 
@@ -411,7 +427,26 @@ class TestDetailPage:
         assert stats["ok"] == 0
         assert stats["done"] == len(tenders)
         assert all(t["決標方式來源"] == core.AWARD_SOURCE_ESTIMATED for t in tenders)
-        assert any("驗證碼防護" in m for m in messages)
+        assert any("額度已用盡" in m for m in messages)
+
+    def test_enrich_makes_no_further_requests_after_quota_runs_out(self, monkeypatch):
+        """
+        額度用盡後不該再打任何一次請求——繼續撞牆只會拖慢搜尋，
+        而且每次重試都可能讓站方的 IP 冷卻重新計時。
+        """
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        calls = []
+
+        def _fake(pk):
+            calls.append(pk)
+            return "", "blocked"
+
+        monkeypatch.setattr(core, "fetch_award_method_status", _fake)
+        tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"}
+                   for i in range(30)]
+        core.enrich_actual_award_methods(tenders, max_workers=1)
+
+        assert len(calls) == core.CAPTCHA_STREAK_LIMIT
 
     def test_enrich_resets_streak_on_success(self, monkeypatch):
         """零星被擋不算數，只有連續被擋才代表真的被防護鎖住。"""
@@ -510,7 +545,47 @@ class TestReports:
         from openpyxl import load_workbook
         wb = load_workbook(path)
         header = [c.value for c in wb["所有搜尋標案"][1]]
-        assert header == [c for c in core.PREFERRED_COLS if c in rows[0]]
+        assert header == core.report_columns(rows)
+        # PREFERRED_COLS 的欄位要照順序排在最前面
+        assert header[:len(core.PREFERRED_COLS)] == core.PREFERRED_COLS
+
+    def test_csv_and_excel_share_the_same_columns(self, tmp_path, search_html):
+        """
+        迴歸測試：同一批資料的兩種輸出曾經欄序不同（Excel 走 PREFERRED_COLS，
+        CSV 走 rows[0].keys()），且 CSV 還多出三欄。使用者對照兩份檔案時會錯亂。
+        """
+        pytest.importorskip("openpyxl")
+        rows = core.parse_tender_rows(search_html, "AI")
+        core.finalize_keywords(rows)
+
+        csv_path = str(tmp_path / "out.csv")
+        xlsx_path = str(tmp_path / "out.xlsx")
+        core.write_csv_report(csv_path, rows)
+        core.write_excel_report(xlsx_path, rows, rows[:1])
+
+        with open(csv_path, encoding="utf-8-sig") as f:
+            csv_header = f.readline().strip().split(",")
+        from openpyxl import load_workbook
+        xlsx_header = [c.value for c in load_workbook(xlsx_path)["所有搜尋標案"][1]]
+
+        assert csv_header == xlsx_header
+
+    def test_csv_keeps_columns_that_only_later_rows_have(self, tmp_path):
+        """
+        先前以 rows[0].keys() 當欄位表且 extrasaction="ignore"，
+        第一列沒有的鍵會被靜默丟掉——資料無聲消失比報錯更糟。
+        """
+        rows = [{"標案名稱": "甲案", "招標機關": "機關甲"},
+                {"標案名稱": "乙案", "招標機關": "機關乙", "備註": "後來才出現的欄位"}]
+        path = str(tmp_path / "out.csv")
+        core.write_csv_report(path, rows)
+
+        with open(path, encoding="utf-8-sig") as f:
+            lines = [line.strip() for line in f]
+        assert "備註" in lines[0].split(",")
+        assert "後來才出現的欄位" in lines[2]
+        # 缺該欄的列要留空，不能整列錯位
+        assert lines[1].endswith(",")
 
 
 # ==================== HTML 工具 ====================
@@ -696,6 +771,171 @@ class TestEnrichmentSelection:
         rows = [self._row("a", "公開招標", "勞務類", "2026/08/20")]
         picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
         assert picked[0] is rows[0]
+
+    def test_skips_rows_already_confirmed(self):
+        """
+        額度稀缺（站方每輪只給約 5 筆詳細頁），已由快取確認過的標案不該再花一次額度。
+        """
+        rows = [
+            self._row("a", "公開取得報價單或企劃書", "勞務類", "2026/08/20"),
+            self._row("b", "公開取得報價單或企劃書", "勞務類", "2026/08/21"),
+        ]
+        core.apply_award_method(rows[1], "最低標")
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
+        assert [r["pk"] for r in picked] == ["a"]
+
+
+class TestAwardCache:
+    """
+    站方每輪只給約 5 筆詳細頁額度，一次執行不可能校驗完整批標案。
+    確認過的結果必須落地累積，否則每次重跑都從零開始，永遠補不完。
+    """
+
+    @staticmethod
+    def _row(tender_id, way="公開取得報價單或企劃書"):
+        desc, is_lowest = core.determine_award_method(way)
+        return {
+            "pk": f"pk-{tender_id}", "標案案號": tender_id, "招標方式": way,
+            "採購性質": "勞務類", "決標方式": desc,
+            "決標方式來源": core.AWARD_SOURCE_ESTIMATED,
+            "是否為勞務類": "是", "是否為最低標": "是" if is_lowest else "否",
+        }
+
+    def test_round_trip(self, tmp_path):
+        path = core.award_cache_path(str(tmp_path))
+        cache = {}
+        core.remember_award(cache, self._row("A1"), "最低標")
+        core.save_award_cache(cache, path)
+
+        loaded = core.load_award_cache(path)
+        assert loaded["A1"]["決標方式"] == "最低標"
+        assert loaded["A1"]["pk"] == "pk-A1"
+        assert loaded["A1"]["verified_at"]
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert core.load_award_cache(str(tmp_path / "nope.json")) == {}
+
+    def test_corrupt_file_returns_empty(self, tmp_path):
+        path = tmp_path / "award_cache.json"
+        path.write_text("{ not json", encoding="utf-8")
+        assert core.load_award_cache(str(path)) == {}
+
+    def test_non_dict_payload_returns_empty(self, tmp_path):
+        path = tmp_path / "award_cache.json"
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        assert core.load_award_cache(str(path)) == {}
+
+    def test_apply_cache_updates_derived_fields(self):
+        """
+        套快取必須連帶更新衍生欄位，否則精選清單仍會用舊的「是否為最低標」收案。
+        """
+        rows = [self._row("A1"), self._row("A2")]
+        cache = {"A1": {"決標方式": "參考最有利標精神"}}
+
+        assert core.apply_award_cache(rows, cache) == 1
+        assert rows[0]["決標方式"] == "參考最有利標精神"
+        assert rows[0]["是否為最低標"] == "否"
+        assert rows[0]["完全符合目標"] == "其他"
+        assert core.is_award_confirmed(rows[0])
+        # 沒被快取涵蓋的那筆維持推估，不能被誤標成已確認
+        assert rows[1]["決標方式"] == "公開取得 (待確認)"
+        assert not core.is_award_confirmed(rows[1])
+
+    def test_apply_cache_removes_them_from_enrichment(self):
+        """套過快取的標案不會再被挑去校驗，額度才花得到刀口上。"""
+        rows = [self._row("A1"), self._row("A2")]
+        core.apply_award_cache(rows, {"A1": {"決標方式": "最低標"}})
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
+        assert [r["標案案號"] for r in picked] == ["A2"]
+
+    def test_empty_cache_is_a_noop(self):
+        rows = [self._row("A1")]
+        assert core.apply_award_cache(rows, {}) == 0
+        assert not core.is_award_confirmed(rows[0])
+
+    def test_enrich_persists_each_success_immediately(self, monkeypatch, tmp_path):
+        """
+        被擋而中止時，已經花掉額度換來的結果必須已經落地，
+        否則下次重跑又要重新花額度確認同一批標案。
+        """
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        # 前兩筆成功，之後一路被擋直到中止
+        monkeypatch.setattr(
+            core, "fetch_award_method_status",
+            lambda pk: ("最低標", "ok") if pk in ("pk-A0", "pk-A1") else ("", "blocked"))
+
+        rows = [self._row(f"A{i}") for i in range(30)]
+        path = core.award_cache_path(str(tmp_path))
+        cache = {}
+        stats = core.enrich_actual_award_methods(rows, max_workers=1,
+                                                 cache=cache, cache_path=path)
+
+        assert stats["blocked"] is True
+        assert sorted(core.load_award_cache(path)) == ["A0", "A1"]
+
+    def test_enrich_without_cache_still_works(self, monkeypatch):
+        """未傳快取時行為不變，CLI 或測試才能單獨呼叫。"""
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
+        rows = [self._row("A1")]
+        assert core.enrich_actual_award_methods(rows)["ok"] == 1
+
+
+class TestCancellation:
+    """
+    全面掃描動輒 120 頁要跑好幾分鐘，使用者發現條件設錯時必須能中斷，
+    而且已經抓到的資料沒有理由丟掉。
+    """
+
+    def test_search_stops_paging_but_keeps_partial_results(self, monkeypatch, search_html,
+                                                           paged_html):
+        stop = {"now": False}
+        pages = []
+
+        def _fake_post(url, form, **kwargs):
+            pages.append(form.get("d-3611-p"))
+            if len(pages) >= 2:
+                stop["now"] = True          # 抓完第 2 頁後使用者按下停止
+            return paged_html
+
+        monkeypatch.setattr(core, "http_post", _fake_post)
+        monkeypatch.setattr(core, "PAGE_DELAY", 0)
+        messages = []
+        rows = core.search_pcc("", "2026/08/01", "2026/08/24", polite_delay=0,
+                               log=messages.append, should_stop=lambda: stop["now"])
+
+        assert len(pages) == 2, "停止後不該再翻下一頁"
+        assert rows, "已抓到的資料必須保留，不能因為中斷就整批丟掉"
+        assert any("已取消翻頁" in m for m in messages)
+
+    def test_search_without_callback_is_unaffected(self, monkeypatch, paged_html):
+        """未傳 should_stop 時行為不變（CLI 走這條路）。"""
+        monkeypatch.setattr(core, "http_post", lambda *a, **kw: paged_html)
+        monkeypatch.setattr(core, "PAGE_DELAY", 0)
+        rows = core.search_pcc("", "2026/08/01", "2026/08/24", polite_delay=0, max_pages=3)
+        assert len(rows) == 150
+
+    def test_enrich_stops_on_request(self, monkeypatch):
+        stop = {"now": False}
+        calls = []
+
+        def _fake(pk):
+            calls.append(pk)
+            if len(calls) >= 3:
+                stop["now"] = True
+            return "最低標", "ok"
+
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", _fake)
+        tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"}
+                   for i in range(20)]
+        stats = core.enrich_actual_award_methods(tenders, max_workers=1,
+                                                 should_stop=lambda: stop["now"])
+
+        assert len(calls) == 3
+        assert stats["ok"] == 3
+        # 停止前確認到的必須保留
+        assert all(core.is_award_confirmed(t) for t in tenders[:3])
 
 
 class TestKeywordHitFiltering:

@@ -8,7 +8,9 @@ app.py (GUI) 與 crawler.py (CLI) 共用本模組，確保分頁、重試、驗�
 
 import concurrent.futures
 import csv
+import json
 import math
+import os
 import random
 import re
 import socket
@@ -17,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import date
 from http.cookiejar import CookieJar
 
 try:
@@ -72,9 +75,14 @@ MAX_RANGE_DAYS = 186
 # 14 天約 2,900 筆 / 58 頁、30 天約 5,600 筆 / 112 頁，故上限訂在 120 頁（6,000 筆）。
 DEFAULT_MAX_PAGES = 120
 
-# 詳細頁校驗的預設筆數上限與節流設定
-DEFAULT_VERIFY_LIMIT = 300
-DETAIL_DELAY_RANGE = (0.3, 0.6)
+# 詳細頁校驗的節流設定。
+#
+# 實測（2026-08）站方對詳細頁是【額度制而非頻率制】：連續請求約 5 筆成功後就會回
+# 「驗證碼檢核」頁，把間隔拉到 2 秒也一樣擋，冷卻是分鐘級且為 IP 層級（換 cookie 無效，
+# 靜置 15 分鐘也未必解除）。硬啃只會讓每次搜尋卡住卻補不了幾筆，因此這裡刻意單執行緒、
+# 低額度：每輪順手撿走免費的那幾筆寫進快取，靠跨次執行累積，被擋就收手。
+DEFAULT_VERIFY_LIMIT = 25
+DETAIL_DELAY_RANGE = (1.0, 2.0)
 CAPTCHA_STREAK_LIMIT = 5
 
 # 對政府伺服器的禮貌間隔（秒）
@@ -83,6 +91,12 @@ PAGE_DELAY = 0.8
 # 決標方式的資料來源，讓使用者一眼看出哪些列只是推估值
 AWARD_SOURCE_ESTIMATED = "依招標方式推估"
 AWARD_SOURCE_OFFICIAL = "官方詳細頁"
+
+# 已確認決標方式的永久快取檔名（放在輸出資料夾，.gitignore 已涵蓋）
+AWARD_CACHE_FILENAME = "award_cache.json"
+
+# GUI 上次使用的搜尋條件（關鍵字、日期模式、採購性質…），下次開啟自動還原
+SETTINGS_FILENAME = "ui_settings.json"
 
 # 匯出報表的欄位順序
 PREFERRED_COLS = [
@@ -468,14 +482,19 @@ def clamp_date_range_days(days: int, log=None) -> int:
 
 def search_pcc(keyword: str, start_date: str, end_date: str, proctrg_cate: str = None,
                max_pages: int = DEFAULT_MAX_PAGES, log=None, polite_delay: float = PAGE_DELAY,
-               date_type: str = DATE_TYPE_SPDT, progress_cb=None) -> list:
+               date_type: str = DATE_TYPE_SPDT, progress_cb=None, should_stop=None) -> list:
     """
     搜尋標案並自動走訪所有分頁。keyword 傳空字串即為該條件下的全面掃描。
 
     log 為選用的單參數回呼（CLI 傳 print，GUI 傳執行緒安全的 log）；
     progress_cb(done_pages, total_pages) 為選用的翻頁進度回呼。
+
+    should_stop 為選用的無參數回呼，回傳 True 即停止翻頁並回傳【已取得的部分結果】——
+    全面掃描動輒上百頁要跑好幾分鐘，使用者發現條件設錯時必須能中斷，
+    而且已經抓到的資料沒有理由丟掉。
     """
     emit = log if callable(log) else (lambda _msg: None)
+    cancelled = should_stop if callable(should_stop) else (lambda: False)
 
     form = build_search_form(keyword, start_date, end_date, proctrg_cate, date_type)
     try:
@@ -519,6 +538,10 @@ def search_pcc(keyword: str, start_date: str, end_date: str, proctrg_cate: str =
         return results
 
     for page_idx in range(2, total_pages + 1):
+        if cancelled():
+            emit(f"  [!] 已取消翻頁，保留已取得的 {len(results)} 筆"
+                 f"（共 {total_pages} 頁中的前 {page_idx - 1} 頁）。")
+            break
         time.sleep(polite_delay)
         paged_form = dict(form)
         paged_form[page_param] = str(page_idx)
@@ -581,6 +604,89 @@ def apply_award_method(tender: dict, actual_award: str):
     tender["完全符合目標"] = "符合 (勞務+最低標)" if (is_service and is_lowest) else "其他"
 
 
+def is_award_confirmed(tender: dict) -> bool:
+    """該筆的決標方式是否已由官方詳細頁確認（而非依招標方式推估）。"""
+    return tender.get("決標方式來源") == AWARD_SOURCE_OFFICIAL
+
+
+# ==================== 已確認決標方式的永久快取 ====================
+#
+# 站方每輪只給約 5 次詳細頁額度，單次執行不可能校驗完整批標案，因此把每一筆確認過的
+# 結果落地保存：下次執行先套快取，額度就只花在還沒確認過的標案上，確認結果逐次累積。
+# key 用「標案案號」而非 pk——案號跨次執行穩定，pk 會隨更正公告改變。
+
+def load_json_dict(path: str) -> dict:
+    """讀取 JSON dict；檔案不存在或內容毀損時回空 dict，絕不讓呼叫端因此中斷。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_json_dict(data: dict, path: str):
+    """先寫暫存檔再 os.replace，避免寫到一半被中斷而毀掉既有檔案。"""
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def award_cache_path(output_dir: str) -> str:
+    """快取檔的完整路徑。"""
+    return os.path.join(output_dir, AWARD_CACHE_FILENAME)
+
+
+def settings_path(output_dir: str) -> str:
+    """GUI 設定檔的完整路徑（與快取同一個資料夾，.gitignore 已涵蓋）。"""
+    return os.path.join(output_dir, SETTINGS_FILENAME)
+
+
+def load_award_cache(path: str) -> dict:
+    """讀取已確認決標方式的快取。"""
+    return load_json_dict(path)
+
+
+def save_award_cache(cache: dict, path: str):
+    """把快取原子性地寫回磁碟。"""
+    save_json_dict(cache, path)
+
+
+def remember_award(cache: dict, tender: dict, actual_award: str):
+    """把一筆已確認的決標方式記進快取（就地更新 cache）。"""
+    tender_id = tender.get("標案案號")
+    if not tender_id or not actual_award:
+        return
+    cache[tender_id] = {
+        "決標方式": actual_award,
+        "pk": tender.get("pk", ""),
+        "verified_at": date.today().isoformat(),
+    }
+
+
+def apply_award_cache(tenders: list, cache: dict) -> int:
+    """把快取中已確認的決標方式套回標案清單，回傳實際套用筆數。"""
+    if not cache:
+        return 0
+    applied = 0
+    for tender in tenders:
+        entry = cache.get(tender.get("標案案號", ""))
+        actual = entry.get("決標方式") if isinstance(entry, dict) else entry
+        if not actual:
+            continue
+        apply_award_method(tender, actual)
+        applied += 1
+    return applied
+
+
 def select_rows_for_enrichment(tenders: list, target_attr: str = "勞務",
                                target_award: str = "最低標",
                                limit: int = DEFAULT_VERIFY_LIMIT,
@@ -591,25 +697,37 @@ def select_rows_for_enrichment(tenders: list, target_attr: str = "勞務",
     只保留「採購性質符合」且「依招標方式推估後仍可能入選」的標案（例如目標是最低標時，
     招標方式已明確屬於評選／限制性者不必再查），並依公告日期由新到舊取前 limit 筆。
     require_keyword_hit 與精選清單的定義一致，好讓有限的校驗次數花在使用者真的會看的標案上。
+    已由快取確認過的標案會被跳過——額度稀缺，不該花在已知答案上。
     """
-    candidates = filter_tenders(tenders, target_attr, target_award, require_keyword_hit)
+    candidates = [t for t in filter_tenders(tenders, target_attr, target_award, require_keyword_hit)
+                  if not is_award_confirmed(t)]
     candidates.sort(key=lambda t: t.get("公告日期", ""), reverse=True)
     if limit and limit > 0:
         return candidates[:limit]
     return candidates
 
 
-def enrich_actual_award_methods(tenders: list, max_workers: int = 3,
-                                progress_cb=None, log=None) -> dict:
+def enrich_actual_award_methods(tenders: list, max_workers: int = 1,
+                                progress_cb=None, log=None,
+                                cache: dict = None, cache_path: str = None,
+                                should_stop=None) -> dict:
     """
-    多執行緒連線官方詳細頁校驗真實決標方式。
+    連線官方詳細頁校驗真實決標方式。
 
-    站方對連續查詢會回「驗證碼檢核」頁，因此這裡刻意降低併發、每次請求前隨機間隔，
-    並在連續 CAPTCHA_STREAK_LIMIT 筆被擋時提前中止（剩餘筆數維持推估值並明確告知）。
+    站方對詳細頁採額度制（實測約 5 筆就會回「驗證碼檢核」頁，且冷卻為 IP 層級的分鐘級），
+    一次執行本來就不可能校驗完整份清單。這裡的策略是【只拿走免費的那幾筆就收手】：
+    單執行緒、每次請求前隨機間隔，連續 CAPTCHA_STREAK_LIMIT 筆被擋即中止，
+    整段最多只多花十幾秒，不讓每次搜尋為了硬啃清單而卡上幾分鐘。
+
+    傳入 cache 與 cache_path 時，每成功一筆就立刻落地保存——這是本模組能補完
+    「公開取得 (待確認)」的唯一途徑：每次搜尋免費撿幾筆，跨次執行累積。
+
+    should_stop 為選用的無參數回呼，回傳 True 即提前收手（使用者按下停止）。
 
     progress_cb(done, total) 為選用回呼；回傳 {"total", "done", "ok", "blocked"}。
     """
     emit = log if callable(log) else (lambda _msg: None)
+    cancelled = should_stop if callable(should_stop) else (lambda: False)
     stats = {"total": len(tenders), "done": 0, "ok": 0, "blocked": False}
     if not tenders:
         return stats
@@ -617,18 +735,17 @@ def enrich_actual_award_methods(tenders: list, max_workers: int = 3,
     total = len(tenders)
     emit(f"[*] 正在連線官方詳細頁校驗決標方式 (共 {total} 筆標案)...")
 
-    counter = {"done": 0, "ok": 0, "streak": 0}
+    counter = {"done": 0, "ok": 0, "streak": 0, "blocked": 0}
     lock = threading.Lock()
     stop = threading.Event()
 
-    def _bump():
-        with lock:
-            counter["done"] += 1
-            return counter["done"]
-
     def _fetch_and_update(tender):
+        if cancelled():
+            stop.set()
         if stop.is_set():
-            done = _bump()
+            with lock:
+                counter["done"] += 1
+                done = counter["done"]
             if progress_cb:
                 progress_cb(done, total)
             return
@@ -642,13 +759,18 @@ def enrich_actual_award_methods(tenders: list, max_workers: int = 3,
             counter["done"] += 1
             if actual:
                 counter["ok"] += 1
+                if cache is not None:
+                    remember_award(cache, tender, actual)
+                    if cache_path:
+                        save_award_cache(cache, cache_path)
             if status == "blocked":
+                counter["blocked"] += 1
                 counter["streak"] += 1
                 if counter["streak"] >= CAPTCHA_STREAK_LIMIT and not stop.is_set():
                     stop.set()
-                    emit(f"  [!] 已被網站驗證碼防護擋下（IP 層級冷卻，重開連線階段無效），中止校驗；"
-                         f"剩餘 {total - counter['done']} 筆維持「{AWARD_SOURCE_ESTIMATED}」，"
-                         f"可稍後再試。")
+                    emit(f"  [!] 本輪額度已用盡（連續 {CAPTCHA_STREAK_LIMIT} 筆被驗證碼防護擋下，"
+                         f"IP 層級冷卻），停止校驗；剩餘 {total - counter['done']} 筆維持"
+                         f"「{AWARD_SOURCE_ESTIMATED}」，已確認的都已寫入快取。")
             else:
                 counter["streak"] = 0
             done = counter["done"]
@@ -656,14 +778,21 @@ def enrich_actual_award_methods(tenders: list, max_workers: int = 3,
         if progress_cb:
             progress_cb(done, total)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         list(executor.map(_fetch_and_update, tenders))
 
     stats.update(done=counter["done"], ok=counter["ok"], blocked=stop.is_set())
 
-    failed = total - counter["ok"]
-    if failed and not stop.is_set():
-        emit(f"  [!] 有 {failed} 筆標案無法取得詳細頁決標方式，該筆維持依招標方式的推估值。")
+    if not stop.is_set():
+        # 被驗證碼擋下與「詳細頁沒有該欄位」是兩回事：前者稍後重試就能拿到，
+        # 後者重試幾次都一樣。混為一談會讓使用者不知道到底該不該再試一次。
+        blocked = counter["blocked"]
+        missing = total - counter["ok"] - blocked
+        if blocked:
+            emit(f"  [!] 有 {blocked} 筆被網站驗證碼防護擋下（詳細頁每輪約 {CAPTCHA_STREAK_LIMIT} 筆額度，"
+                 f"冷卻為 IP 層級），維持「{AWARD_SOURCE_ESTIMATED}」，稍後重試即可。")
+        if missing:
+            emit(f"  [!] 有 {missing} 筆標案的詳細頁沒有決標方式欄位，維持依招標方式的推估值。")
     return stats
 
 
@@ -737,9 +866,25 @@ def filter_tenders(tenders: list, target_attr: str = "勞務", target_award: str
 
 # ==================== 報表輸出 ====================
 
+def report_columns(rows: list) -> list:
+    """
+    決定報表欄位順序：PREFERRED_COLS 先，其餘實際存在的欄位照首次出現順序接在後面。
+
+    Excel 與 CSV 必須共用這一份，否則同一批資料兩種輸出的欄序會不一樣
+    （這正是先前的實際狀況），而且尾巴的欄位會被靜默丟掉。
+    """
+    seen = []
+    for row in rows:
+        for key in row:
+            if key not in INTERNAL_KEYS and key not in seen:
+                seen.append(key)
+    preferred = [c for c in PREFERRED_COLS if c in seen]
+    return preferred + [c for c in seen if c not in preferred]
+
+
 def _ordered_frame(tenders: list):
     df = pd.DataFrame(tenders)
-    cols = [c for c in PREFERRED_COLS if c in df.columns]
+    cols = [c for c in report_columns(tenders) if c in df.columns]
     return df[cols] if cols else df
 
 
@@ -760,12 +905,19 @@ def write_excel_report(path: str, all_tenders: list, matched_tenders: list) -> s
 
 
 def write_csv_report(path: str, rows: list) -> str:
-    """輸出 CSV（UTF-8 BOM，Excel 可直接開啟）。回傳實際寫出的路徑。"""
+    """
+    輸出 CSV（UTF-8 BOM，Excel 可直接開啟）。回傳實際寫出的路徑。
+
+    欄位順序與 Excel 報表共用 report_columns()，並掃過所有列取欄位聯集——
+    先前只看 rows[0] 的鍵，欄序與 Excel 不同，後面列才出現的欄位還會被靜默丟掉。
+    """
     if not rows:
         return ""
-    keys = [k for k in rows[0].keys() if k not in INTERNAL_KEYS]
+    keys = report_columns(rows)
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore",
+                               restval="")
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in keys})
     return path

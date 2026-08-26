@@ -74,19 +74,32 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
         print("[INFO] 本次搜尋條件下未發現任何標案。")
         return
 
-    # 只校驗有機會入選的標案，避免上千次請求被站方驗證碼防護擋下
+    # 先套快取：站方的詳細頁額度極少（每輪約 5 筆），確認過的標案不該再花一次
+    cache_path = core.award_cache_path(OUTPUT_DIR)
+    cache = core.load_award_cache(cache_path)
+    applied = core.apply_award_cache(tenders_list, cache)
+    if applied:
+        print(f"\n[CACHE] 由 {cache_path} 套用 {applied} 筆先前已確認的官方決標方式（不花額度）。")
+
+    # 只校驗有機會入選、且尚未確認的標案，避免上千次請求被站方驗證碼防護擋下
     if verify:
         targets = core.select_rows_for_enrichment(tenders_list, target_attr, target_award_way,
                                                   limit=verify_limit,
                                                   require_keyword_hit=not include_keyword_misses)
         if targets:
-            print(f"\n[VERIFY] 從 {len(tenders_list)} 筆中挑出 {len(targets)} 筆候選，"
+            print(f"\n[VERIFY] 從 {len(tenders_list)} 筆中挑出 {len(targets)} 筆尚未確認的候選，"
                   f"連線官方詳細頁校驗決標方式...")
-            stats = core.enrich_actual_award_methods(targets, log=print)
-            print(f"[VERIFY] {stats['ok']}/{stats['total']} 筆取得官方決標方式，"
-                  f"其餘維持「{core.AWARD_SOURCE_ESTIMATED}」。")
+            stats = core.enrich_actual_award_methods(targets, log=print,
+                                                     cache=cache, cache_path=cache_path)
+            if stats["blocked"]:
+                print(f"[VERIFY] 本次確認 {stats['ok']} 筆後官網額度用盡，已中止。"
+                      f"確認結果已寫入 {cache_path}，下次執行會直接套用。")
+            else:
+                print(f"[VERIFY] {stats['ok']}/{stats['total']} 筆取得官方決標方式，"
+                      f"其餘維持「{core.AWARD_SOURCE_ESTIMATED}」。")
     else:
-        print(f"\n[VERIFY] 已略過深度校驗，決標方式全部為「{core.AWARD_SOURCE_ESTIMATED}」。")
+        print(f"\n[VERIFY] 已略過深度校驗，未快取的標案決標方式全部為"
+              f"「{core.AWARD_SOURCE_ESTIMATED}」。")
 
     # 精選 = 採購性質 ∩ 決標方式 ∩ 命中關鍵字；未命中者不會被丟掉，仍在「所有搜尋標案」。
     qualified = core.filter_tenders(tenders_list, target_attr, target_award_way)
@@ -97,10 +110,17 @@ def run_crawler(keywords: list, days: int, target_attr: str, target_award_way: s
     print("\n" + "=" * 65)
     print("[SUMMARY] 執行成果摘要")
     print(f"  • 全部搜尋到標案: {len(tenders_list)} 筆")
+    pending = sum(1 for t in qualified
+                  if not core.is_award_confirmed(t) and "待確認" in t.get("決標方式", ""))
     print(f"  • 符合【{target_attr} + {target_award_way}】: {len(qualified)} 筆"
           f"（其中命中關鍵字 {len(keyword_hits)} 筆）")
     print(f"  • 精選清單: {len(matched_tenders)} 筆"
           + ("（含未命中關鍵字者）" if include_keyword_misses else "（條件 ∩ 關鍵字）"))
+    if pending:
+        print(f"  • ⚠️ 其中 {pending} 筆決標方式仍為「公開取得 (待確認)」——搜尋結果頁看不出決標方式，"
+              f"實測這類標案有相當比例其實是最有利標；")
+        print(f"       官網每輪只給約 {core.CAPTCHA_STREAK_LIMIT} 筆詳細頁額度，無法一次查完；"
+              f"每次執行會自動補幾筆進 {cache_path}，要立刻確認請開該筆的詳細連結自行查看。")
     print("=" * 65)
 
     if matched_tenders:
