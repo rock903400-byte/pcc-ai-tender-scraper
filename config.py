@@ -58,7 +58,15 @@ TARGET_AWARD_WAY = "最低標"
 # 4. 預設查詢時間範圍 (天數)
 DEFAULT_DAYS = 7
 
-# 5. 輸出設定
+# 5. 決標方式的資料來源
+#
+# True  = 主來源用公開資料鏡像 API（pcc_mirror），官網詳細頁只在鏡像查無此案時備援。
+#         官網詳細頁對「決標方式」是 IP 層級的額度制（約 5 筆就回驗證碼檢核頁、
+#         冷卻分鐘級），只靠它永遠補不完待確認清單。
+# False = 只用官網詳細頁（舊行為）。除非鏡像服務出問題，否則沒有理由關掉。
+USE_MIRROR_SOURCE = True
+
+# 6. 輸出設定
 OUTPUT_DIR = "output"
 EXPORT_EXCEL = True
 EXPORT_CSV = True

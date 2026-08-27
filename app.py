@@ -2,12 +2,13 @@
 """
 政府電子採購網 - AI 與資訊勞務最低標標案爬蟲 GUI 應用程式
 
-使用 ttkbootstrap 建構桌面介面，支援背景執行緒搜尋、官方詳細頁決標方式校驗、
+使用 ttkbootstrap 建構桌面介面，支援背景執行緒搜尋、決標方式校驗、
 表格多欄位型態感知排序（金額／日期／字串）、即時進度與 Excel / CSV 匯出。
 
-官網對詳細頁採額度制（每輪約 5 筆就會要求驗證碼），一次搜尋校驗不完整份清單。
-因此每輪免費確認到的那幾筆都會寫入 output/award_cache.json，下次搜尋自動套用——
-不需要使用者做任何事，確認結果會跨次執行慢慢累積；還沒確認的列在畫面上明確標示。
+決標方式的主來源是公開資料鏡像 API（pcc_mirror），官網詳細頁只在鏡像查無此案時備援——
+官網對詳細頁採 IP 層級額度制（每輪約 5 筆就會要求驗證碼），只靠它補不完待確認清單。
+確認結果一律寫入 output/award_cache.json，下次搜尋自動套用；
+還沒確認的列在畫面上明確標示，背景涓流會持續把它們補完。
 
 爬取與解析邏輯共用自 pcc_core，與 CLI 版 crawler.py 為同一份實作。
 """
@@ -31,7 +32,7 @@ except ImportError:  # pragma: no cover - 取決於安裝的 ttkbootstrap 版本
     from ttkbootstrap.scrolled import ScrolledText
 
 import pcc_core as core
-from config import DEFAULT_KEYWORDS
+from config import DEFAULT_KEYWORDS, USE_MIRROR_SOURCE
 
 core.install_ipv4_preference()
 
@@ -54,9 +55,173 @@ COLUMN_FIELD = {col_id: field for col_id, _, _, _, field in COLUMNS_CONFIG}
 # 搜尋階段佔進度條的比例，其餘留給詳細頁校驗
 SEARCH_PROGRESS_SHARE = 70
 
+# 背景涓流校驗的間隔。只在使用者按搜尋時補那一批，一天補一兩次，待確認量只會發散；
+# 每 15 分鐘補一輪、一天約 96 輪，才追得上新標案的產生速度。
+# 間隔不再往下壓：鏡像是志工維運的免費服務，沒有理由把它當成自己的資料庫來刷。
+TRICKLE_INTERVAL_MS = core.DEFAULT_TRICKLE_INTERVAL_SECONDS * 1000
+
 # 列的標示色：決標方式尚未經官方詳細頁確認 / 已確認但不符篩選條件
 PENDING_COLOR = "#c25e00"
 DISQUALIFIED_COLOR = "#9aa0a6"
+
+
+class TenderTable:
+    """
+    一個結果分頁：表格 + 快速篩選框 + 自己的排序狀態。
+
+    兩個分頁各持一份實例。先前這些狀態全攤在 PCCScraperApp 上，靠 is_matched 布林
+    在十幾處分流（tree_matched / tree_all、sort_state_matched / sort_state_all、
+    filter_entry_matched / filter_entry_all…），每加一個分頁層級的功能就要再改
+    一輪那些三元運算式，而且很容易漏掉其中一處。
+
+    rows 是這個分頁【目前要顯示的資料】，由外面指派；排序就地重排這份清單，
+    篩選只影響畫面、不動資料。
+    """
+
+    def __init__(self, app, parent, is_shortlist: bool):
+        self.app = app
+        self.is_shortlist = is_shortlist
+        self.rows = []
+        self.sort_state = {"col": None, "reverse": False}
+
+        top_filter = tb.Frame(parent, padding=(5, 5))
+        top_filter.pack(fill=X)
+
+        tb.Label(top_filter, text="🔍 快速篩選:").pack(side=LEFT, padx=(0, 5))
+        self.entry = tb.Entry(top_filter, width=25)
+        self.entry.pack(side=LEFT, padx=(0, 10))
+
+        if is_shortlist:
+            # 全面掃描會撈回整批勞務標案（午餐、粉刷、校外教學…），
+            # 精選預設只留命中關鍵字者；未命中者沒被丟掉，勾起來即可看回。
+            tb.Checkbutton(top_filter, text="包含未命中關鍵字",
+                           variable=app.include_misses_var,
+                           command=app.on_include_misses_toggled,
+                           bootstyle="round-toggle").pack(side=LEFT, padx=(0, 10))
+            # 「公開取得」的決標方式在搜尋結果頁看不出來，未校驗前只是推估；
+            # 這個開關讓使用者一鍵把還沒確認的那些收起來，只看比較可信的列。
+            tb.Checkbutton(top_filter, text="隱藏待確認",
+                           variable=app.hide_pending_var,
+                           command=self.render,
+                           bootstyle="round-toggle").pack(side=LEFT, padx=(0, 10))
+
+        col_ids = [c[0] for c in COLUMNS_CONFIG]
+        self.tree = tb.Treeview(parent, columns=col_ids, show="headings",
+                                bootstyle="primary", selectmode="browse")
+        self.tree.tag_configure("unconfirmed", foreground=PENDING_COLOR)
+        self.tree.tag_configure("disqualified", foreground=DISQUALIFIED_COLOR)
+
+        tb.Button(top_filter, text="🔗 開啟選取標案網頁", bootstyle="outline-primary",
+                  command=self.open_selected).pack(side=RIGHT)
+
+        for col_id, col_name, width, align, _field in COLUMNS_CONFIG:
+            self.tree.heading(col_id, text=col_name, anchor=align,
+                              command=lambda c=col_id: self.sort_by(c))
+            self.tree.column(col_id, width=width, anchor=align)
+
+        scrollbar_y = tb.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        scrollbar_x = tb.Scrollbar(parent, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+
+        scrollbar_y.pack(side=RIGHT, fill=Y)
+        scrollbar_x.pack(side=BOTTOM, fill=X)
+        self.tree.pack(fill=BOTH, expand=True)
+
+        # 欄寬固定，長標案名一定會被截斷；滑過去顯示完整內容，免得非開瀏覽器不可
+        self.tree.bind("<Motion>", lambda event: app.on_tree_hover(self.tree, event))
+        self.tree.bind("<Leave>", lambda _event: app.hide_tooltip())
+        self.tree.bind("<Double-1>", lambda _event: self.open_selected())
+        self.entry.bind("<KeyRelease>", lambda _event: self.render())
+
+    # ---------- 篩選框 ----------
+
+    @property
+    def query(self) -> str:
+        return self.entry.get()
+
+    def focus_query(self):
+        self.entry.focus_set()
+        self.entry.select_range(0, END)
+
+    def clear_query(self) -> bool:
+        """清掉快速篩選並重畫；回傳原本是否有東西可清。"""
+        if not self.entry.get():
+            return False
+        self.entry.delete(0, END)
+        self.render()
+        return True
+
+    # ---------- 排序 ----------
+
+    def sort_by(self, col_id: str):
+        """點擊欄頭切換升降冪排序。"""
+        if not self.rows:
+            return
+        state = self.sort_state
+        if state["col"] == col_id:
+            state["reverse"] = not state["reverse"]
+        else:
+            state["col"] = col_id
+            # 預算與日期預設先以降冪（最高/最新）呈現，其餘預設升冪
+            state["reverse"] = col_id in ("budget", "pub_date", "deadline")
+
+        self.resort()
+        indicator = " ▼" if state["reverse"] else " ▲"
+        for c_id, c_name, _w, _a, _f in COLUMNS_CONFIG:
+            self.tree.heading(c_id, text=f"{c_name}{indicator}" if c_id == col_id else c_name)
+        self.render()
+
+    def resort(self):
+        """就地套用目前的排序狀態（資料換過一批之後要重新排）。"""
+        col_id = self.sort_state["col"]
+        if col_id:
+            self.rows.sort(key=lambda t: self.app.extract_sort_key(t, col_id),
+                           reverse=self.sort_state["reverse"])
+
+    # ---------- 繪製 ----------
+
+    def _is_hidden(self, tender: dict) -> bool:
+        """「隱藏待確認」只對精選分頁有意義：全部標案那頁本來就什麼都該看得到。"""
+        return (self.is_shortlist and self.app.hide_pending()
+                and self.app.is_award_pending(tender))
+
+    def render(self):
+        """依 rows 與目前的快速篩選重畫整張表。"""
+        query = self.query.strip().lower()
+        self.tree.delete(*self.tree.get_children())
+
+        seq = 1
+        for tender in self.rows:
+            if self._is_hidden(tender):
+                continue
+            haystack = " ".join([
+                tender.get("招標機關", ""), tender.get("標案名稱", ""),
+                tender.get("標案案號", ""), tender.get("命中關鍵字", ""),
+            ]).lower()
+            if query and query not in haystack:
+                continue
+            # 以 pk 作為 item id，開啟連結時可直接回查，不必比對標案名稱
+            self.tree.insert("", END, iid=tender.get("pk", f"row{seq}"),
+                             values=self.app.row_values(tender, seq),
+                             tags=self.app.row_tags(tender))
+            seq += 1
+
+    def clear(self):
+        self.tree.delete(*self.tree.get_children())
+
+    # ---------- 選取 ----------
+
+    def open_selected(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "請先點選欲查看的標案列！")
+            return
+        tender = self.app.tenders_by_pk.get(selection[0])
+        target_url = tender.get("詳細連結") if tender else None
+        if target_url:
+            webbrowser.open(target_url)
+        else:
+            messagebox.showwarning("警告", "無法找到該標案的詳細網址！")
 
 
 class PCCScraperApp(tb.Window):
@@ -72,31 +237,44 @@ class PCCScraperApp(tb.Window):
         self.cancel_event = threading.Event()
         self.tenders_all = []
         # 精選有兩份：符合採購性質＋決標方式者，以及其中還命中關鍵字者。
-        # tenders_matched 永遠指向目前顯示中的那一份，排序與快速篩選才不必分兩套。
+        # 目前顯示中的那一份就是 table_matched.rows（見 tenders_matched）。
         self.tenders_qualified = []
         self.tenders_keyword_hits = []
-        self.tenders_matched = []
         self.tenders_by_pk = {}
+
+        # 兩個核取方塊的狀態要在建表格之前就存在（TenderTable 會綁上去），
+        # 而且它們也是搜尋條件的一部分，會一起存進 ui_settings.json。
+        self.include_misses_var = tk.BooleanVar(value=False)
+        self.hide_pending_var = tk.BooleanVar(value=False)
         self.output_dir = os.path.abspath("output")
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # 排序狀態記錄
-        self.sort_state_matched = {"col": None, "reverse": False}
-        self.sort_state_all = {"col": None, "reverse": False}
-        self.filter_entry_matched = None
-        self.filter_entry_all = None
         self._tooltip = None
         self._tooltip_row = None
 
         # 背景執行緒 -> 主執行緒的訊息佇列（Tkinter 僅能於主執行緒操作 widget）
         self.ui_queue = queue.Queue()
 
+        # 背景涓流校驗的排程代號與執行中旗標（僅主執行緒讀寫排程代號）
+        self._trickle_job = None
+        self._trickle_busy = False
+
         # 目前套用的篩選條件，用於分頁標題文字與「已確認但不符條件」的判定
         self.active_filter_label = "勞務最低標"
+        self.active_attr_target = "勞務"
         self.active_award_target = "最低標"
         self.default_keywords = " ".join(DEFAULT_KEYWORDS)
         self.setup_ui()
         self.after(100, self._drain_ui_queue)
+
+    @property
+    def tenders_matched(self) -> list:
+        """目前顯示在精選分頁的那一份資料（匯出與統計都以它為準）。"""
+        return self.table_matched.rows
+
+    @tenders_matched.setter
+    def tenders_matched(self, rows: list):
+        self.table_matched.rows = rows
 
     # ==================== UI 建構 ====================
 
@@ -139,6 +317,13 @@ class PCCScraperApp(tb.Window):
         # 搜尋一律掃全部標案，關鍵字只用於標記與快速篩選，避免關鍵字沒涵蓋到就整筆漏抓
         self.verify_var = tk.BooleanVar(value=True)
         tb.Checkbutton(kw_frame, text="深度校驗決標方式", variable=self.verify_var,
+                       bootstyle="round-toggle").pack(side=RIGHT, padx=(0, 15))
+
+        # 一次搜尋只補目前這批候選，待確認清單通常還有上千筆。開著這個開關，
+        # 程式會在背景每 15 分鐘自己補一輪，橘色列會隨著時間慢慢變少。
+        self.trickle_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(kw_frame, text="背景持續補齊", variable=self.trickle_var,
+                       command=self.on_trickle_toggled,
                        bootstyle="round-toggle").pack(side=RIGHT, padx=(0, 15))
 
         # 條件與動作分兩列：四個下拉與四顆按鈕擠同一列時，
@@ -214,11 +399,11 @@ class PCCScraperApp(tb.Window):
 
         self.tab_matched = tb.Frame(self.notebook)
         self.notebook.add(self.tab_matched, text=" 🏆 精選：勞務最低標 (0 筆) ")
-        self.setup_treeview(self.tab_matched, is_matched=True)
+        self.table_matched = TenderTable(self, self.tab_matched, is_shortlist=True)
 
         self.tab_all = tb.Frame(self.notebook)
         self.notebook.add(self.tab_all, text=" 📋 所有搜尋標案 (0 筆) ")
-        self.setup_treeview(self.tab_all, is_matched=False)
+        self.table_all = TenderTable(self, self.tab_all, is_shortlist=False)
 
         self.tab_logs = tb.Frame(self.notebook)
         self.notebook.add(self.tab_logs, text=" 📝 執行紀錄 ")
@@ -322,28 +507,24 @@ class PCCScraperApp(tb.Window):
         # 關鍵字打完直接 Enter 就開始，不必再把手移到滑鼠
         self.kw_entry.bind("<Return>", _wrap(self.on_start_scrape))
 
-    def active_filter_entry(self):
-        """目前顯示中的那個分頁的快速篩選框（執行紀錄分頁沒有）。"""
+    def active_table(self):
+        """目前顯示中的那個結果分頁（執行紀錄分頁沒有表格，回 None）。"""
         index = self.notebook.index(self.notebook.select())
-        return {0: self.filter_entry_matched, 1: self.filter_entry_all}.get(index)
+        return {0: self.table_matched, 1: self.table_all}.get(index)
 
     def focus_filter_entry(self):
-        entry = self.active_filter_entry()
-        if entry is not None:
-            entry.focus_set()
-            entry.select_range(0, END)
+        table = self.active_table()
+        if table is not None:
+            table.focus_query()
 
     def on_escape(self):
         """搜尋中就是停止；否則清掉目前分頁的快速篩選。"""
         if self.is_running:
             self.on_cancel_scrape()
             return
-        entry = self.active_filter_entry()
-        if entry is not None and entry.get():
-            entry.delete(0, END)
-            is_matched = self.notebook.index(self.notebook.select()) == 0
-            tree = self.tree_matched if is_matched else self.tree_all
-            self.filter_treeview(tree, "", is_matched=is_matched)
+        table = self.active_table()
+        if table is not None:
+            table.clear_query()
 
     # ==================== 使用者設定的存讀 ====================
     #
@@ -362,6 +543,7 @@ class PCCScraperApp(tb.Window):
             "attr": self.attr_combo.get(),
             "award": self.award_combo.get(),
             "verify": bool(self.verify_var.get()),
+            "trickle": bool(self.trickle_var.get()),
             "include_misses": bool(self.include_misses_var.get()),
             "hide_pending": bool(self.hide_pending_var.get()),
         }
@@ -389,6 +571,7 @@ class PCCScraperApp(tb.Window):
                 combo.set(value)
 
         for key, var in (("verify", self.verify_var),
+                         ("trickle", self.trickle_var),
                          ("include_misses", self.include_misses_var),
                          ("hide_pending", self.hide_pending_var)):
             if isinstance(saved.get(key), bool):
@@ -398,76 +581,18 @@ class PCCScraperApp(tb.Window):
         return True
 
     def save_settings(self):
-        """存檔失敗不該影響使用者做事，因此只記一行 log。"""
+        """存檔失敗不該影響使用者做事，但也不能靜默——下次開啟條件沒還原時要查得到原因。"""
         try:
-            core.save_json_dict(self.current_settings(), self.settings_path())
+            if not core.save_json_dict(self.current_settings(), self.settings_path()):
+                self._append_log(f"  ⚠️ 無法寫入搜尋條件 {self.settings_path()}，"
+                                 f"下次開啟不會還原這次的條件。")
         except Exception as e:
             self._append_log(f"  ⚠️ 儲存搜尋條件失敗: {e}")
 
     def on_close(self):
+        self.cancel_trickle()
         self.save_settings()
         self.destroy()
-
-    def setup_treeview(self, parent_frame, is_matched: bool):
-        top_filter = tb.Frame(parent_frame, padding=(5, 5))
-        top_filter.pack(fill=X)
-
-        tb.Label(top_filter, text="🔍 快速篩選:").pack(side=LEFT, padx=(0, 5))
-        filter_entry = tb.Entry(top_filter, width=25)
-        filter_entry.pack(side=LEFT, padx=(0, 10))
-
-        if is_matched:
-            self.filter_entry_matched = filter_entry
-            # 全面掃描會撈回整批勞務標案（午餐、粉刷、校外教學…），
-            # 精選預設只留命中關鍵字者；未命中者沒被丟掉，勾起來即可看回。
-            self.include_misses_var = tk.BooleanVar(value=False)
-            tb.Checkbutton(top_filter, text="包含未命中關鍵字",
-                           variable=self.include_misses_var,
-                           command=self.on_include_misses_toggled,
-                           bootstyle="round-toggle").pack(side=LEFT, padx=(0, 10))
-            # 「公開取得」的決標方式在搜尋結果頁看不出來，未校驗前只是推估；
-            # 這個開關讓使用者一鍵把還沒確認的那些收起來，只看比較可信的列。
-            self.hide_pending_var = tk.BooleanVar(value=False)
-            tb.Checkbutton(top_filter, text="隱藏待確認",
-                           variable=self.hide_pending_var,
-                           command=self.on_hide_pending_toggled,
-                           bootstyle="round-toggle").pack(side=LEFT, padx=(0, 10))
-        else:
-            self.filter_entry_all = filter_entry
-
-        col_ids = [c[0] for c in COLUMNS_CONFIG]
-        tree = tb.Treeview(parent_frame, columns=col_ids, show="headings",
-                           bootstyle="primary", selectmode="browse")
-        tree.tag_configure("unconfirmed", foreground=PENDING_COLOR)
-        tree.tag_configure("disqualified", foreground=DISQUALIFIED_COLOR)
-
-        tb.Button(top_filter, text="🔗 開啟選取標案網頁", bootstyle="outline-primary",
-                  command=lambda: self.open_selected_link(tree)).pack(side=RIGHT)
-
-        for col_id, col_name, width, align, _field in COLUMNS_CONFIG:
-            tree.heading(col_id, text=col_name, anchor=align,
-                         command=lambda c=col_id: self.on_sort_column(tree, c, is_matched))
-            tree.column(col_id, width=width, anchor=align)
-
-        scrollbar_y = tb.Scrollbar(parent_frame, orient="vertical", command=tree.yview)
-        scrollbar_x = tb.Scrollbar(parent_frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
-
-        scrollbar_y.pack(side=RIGHT, fill=Y)
-        scrollbar_x.pack(side=BOTTOM, fill=X)
-        tree.pack(fill=BOTH, expand=True)
-
-        # 欄寬固定，長標案名一定會被截斷；滑過去顯示完整內容，免得非開瀏覽器不可
-        tree.bind("<Motion>", lambda event: self.on_tree_hover(tree, event))
-        tree.bind("<Leave>", lambda _event: self.hide_tooltip())
-        tree.bind("<Double-1>", lambda event: self.open_selected_link(tree))
-        filter_entry.bind("<KeyRelease>",
-                          lambda event: self.filter_treeview(tree, filter_entry.get(), is_matched))
-
-        if is_matched:
-            self.tree_matched = tree
-        else:
-            self.tree_all = tree
 
     # ==================== 執行緒安全的 UI 更新 ====================
 
@@ -490,6 +615,8 @@ class PCCScraperApp(tb.Window):
                     self.on_scrape_failed(payload)
                 elif action == "notice":
                     self.add_notice(payload)
+                elif action == "trickle":
+                    self.on_trickle_round_done(payload)
         except queue.Empty:
             pass
         finally:
@@ -539,31 +666,6 @@ class PCCScraperApp(tb.Window):
             return str(item.get("標案案號", ""))
         return str(item.get(field, ""))
 
-    def on_sort_column(self, tree, col_id: str, is_matched: bool):
-        """點擊欄頭切換升降冪排序"""
-        state = self.sort_state_matched if is_matched else self.sort_state_all
-        dataset = self.tenders_matched if is_matched else self.tenders_all
-        if not dataset:
-            return
-
-        if state["col"] == col_id:
-            state["reverse"] = not state["reverse"]
-        else:
-            state["col"] = col_id
-            # 預算與日期預設先以降冪（最高/最新）呈現，其餘預設升冪
-            state["reverse"] = col_id in ("budget", "pub_date", "deadline")
-
-        reverse = state["reverse"]
-        dataset.sort(key=lambda t: self.extract_sort_key(t, col_id), reverse=reverse)
-
-        indicator = " ▼" if reverse else " ▲"
-        for c_id, c_name, _w, _a, _f in COLUMNS_CONFIG:
-            tree.heading(c_id, text=f"{c_name}{indicator}" if c_id == col_id else c_name)
-
-        # 重新整理顯示內容（維持目前的篩選框文字）
-        filter_entry = self.filter_entry_matched if is_matched else self.filter_entry_all
-        self.filter_treeview(tree, filter_entry.get() if filter_entry else "", is_matched)
-
     @staticmethod
     def row_values(tender: dict, seq) -> tuple:
         """欄位順序必須與 COLUMNS_CONFIG 一致；單筆校驗後也走同一份實作重繪。"""
@@ -602,27 +704,6 @@ class PCCScraperApp(tb.Window):
         """僅限主執行緒呼叫（Tkinter 變數不可跨執行緒讀取）。"""
         return bool(self.hide_pending_var.get())
 
-    def filter_treeview(self, tree, query: str, is_matched: bool):
-        query = query.strip().lower()
-        dataset = self.tenders_matched if is_matched else self.tenders_all
-        hide_pending = is_matched and self.hide_pending()
-        tree.delete(*tree.get_children())
-
-        seq = 1
-        for t in dataset:
-            if hide_pending and self.is_award_pending(t):
-                continue
-            haystack = " ".join([
-                t.get("招標機關", ""), t.get("標案名稱", ""),
-                t.get("標案案號", ""), t.get("命中關鍵字", ""),
-            ]).lower()
-            if query and query not in haystack:
-                continue
-            # 以 pk 作為 item id，開啟連結時可直接回查，不必比對標案名稱
-            tree.insert("", END, iid=t.get("pk", f"row{seq}"),
-                        values=self.row_values(t, seq), tags=self.row_tags(t))
-            seq += 1
-
     def include_misses(self) -> bool:
         """僅限主執行緒呼叫（Tkinter 變數不可跨執行緒讀取）。"""
         return bool(self.include_misses_var.get())
@@ -633,22 +714,12 @@ class PCCScraperApp(tb.Window):
                                 else self.tenders_keyword_hits)
         self._update_matched_tab_title()
 
-    def on_hide_pending_toggled(self):
-        """切換是否隱藏決標方式尚未確認的列（只影響精選分頁的顯示）。"""
-        query = self.filter_entry_matched.get() if self.filter_entry_matched else ""
-        self.filter_treeview(self.tree_matched, query, is_matched=True)
-
     def on_include_misses_toggled(self):
         """在「條件 ∩ 關鍵字」與「全部符合條件」兩份精選之間切換顯示。"""
         self._apply_matched_dataset()
-
         # 保留目前的排序方向與快速篩選文字，切換後不必重按一次
-        state = self.sort_state_matched
-        if state["col"]:
-            self.tenders_matched.sort(
-                key=lambda t: self.extract_sort_key(t, state["col"]), reverse=state["reverse"])
-        query = self.filter_entry_matched.get() if self.filter_entry_matched else ""
-        self.filter_treeview(self.tree_matched, query, is_matched=True)
+        self.table_matched.resort()
+        self.table_matched.render()
 
     def _update_matched_tab_title(self):
         """分頁標題把被折疊的筆數也講出來，不讓標案無聲消失。"""
@@ -675,21 +746,13 @@ class PCCScraperApp(tb.Window):
         self.kw_entry.delete(0, END)
         self.kw_entry.insert(0, self.default_keywords)
 
-    def open_selected_link(self, tree):
-        selection = tree.selection()
-        if not selection:
-            messagebox.showinfo("提示", "請先點選欲查看的標案列！")
-            return
-        tender = self.tenders_by_pk.get(selection[0])
-        target_url = tender.get("詳細連結") if tender else None
-        if target_url:
-            webbrowser.open(target_url)
-        else:
-            messagebox.showwarning("警告", "無法找到該標案的詳細網址！")
-
     def award_cache_path(self) -> str:
         """已確認決標方式的快取檔位置（搜尋時自動讀寫，不需使用者操作）。"""
         return core.award_cache_path(self.output_dir)
+
+    def pending_queue_path(self) -> str:
+        """待確認佇列檔位置（背景涓流校驗的取件來源）。"""
+        return core.pending_queue_path(self.output_dir)
 
     def open_output_dir(self):
         if not os.path.exists(self.output_dir):
@@ -698,6 +761,100 @@ class PCCScraperApp(tb.Window):
             os.startfile(self.output_dir)
         else:
             webbrowser.open(f"file://{self.output_dir}")
+
+    # ==================== 背景涓流校驗 ====================
+    #
+    # 一次搜尋只能免費撿走約 5 筆決標方式，補不完整份待確認清單。與其要使用者
+    # 反覆按搜尋，不如讓程式自己照固定節奏去撿：每一輪的成果都寫進快取，
+    # 畫面上的橘色列會隨著時間自己變少，使用者什麼都不必做。
+
+    def on_trickle_toggled(self):
+        """使用者切換「背景持續補齊」：開就排下一輪，關就把排程收掉。"""
+        self.save_settings()
+        if self.trickle_var.get():
+            self.schedule_trickle()
+            self._append_log(f"🔄 背景補齊已開啟，每 {core.DEFAULT_TRICKLE_INTERVAL_SECONDS // 60} "
+                             f"分鐘自動補一輪決標方式。")
+        else:
+            self.cancel_trickle()
+            self._append_log("⏸ 背景補齊已關閉，決標方式只會在按下搜尋時補。")
+
+    def cancel_trickle(self):
+        """僅限主執行緒：取消尚未觸發的下一輪。"""
+        if self._trickle_job is not None:
+            try:
+                self.after_cancel(self._trickle_job)
+            except (tk.TclError, ValueError):
+                pass  # 視窗已關閉或排程早已觸發
+            self._trickle_job = None
+
+    def schedule_trickle(self, delay_ms: int = TRICKLE_INTERVAL_MS):
+        """僅限主執行緒：排下一輪背景校驗（同時間只會有一個排程）。"""
+        self.cancel_trickle()
+        if not self.trickle_var.get():
+            return
+        try:
+            self._trickle_job = self.after(delay_ms, self._start_trickle_round)
+        except tk.TclError:
+            self._trickle_job = None  # 視窗正在關閉
+
+    def _start_trickle_round(self):
+        """僅限主執行緒：把一輪校驗丟到背景執行緒，避免卡住畫面。"""
+        self._trickle_job = None
+        if not self.trickle_var.get():
+            return
+        # 搜尋中不要跟前景搶同一批來源的請求配額，等下一輪再說
+        if self.is_running or self._trickle_busy:
+            self.schedule_trickle()
+            return
+
+        self._trickle_busy = True
+        threading.Thread(target=self._trickle_worker, daemon=True).start()
+
+    def _trickle_worker(self):
+        """背景執行緒：跑一輪 trickle_verify，結果丟回主執行緒。"""
+        try:
+            result = core.trickle_verify(self.award_cache_path(), self.pending_queue_path(),
+                                         use_mirror=USE_MIRROR_SOURCE)
+        except Exception as e:
+            # 背景工作不該把整個應用程式帶走，記一行就好
+            self.log(f"  ⚠️ 背景補齊發生錯誤: {e.__class__.__name__}: {e}")
+            result = {"picked": 0, "ok": 0, "blocked": False, "remaining": 0}
+        self._post("trickle", result)
+
+    def on_trickle_round_done(self, result: dict):
+        """僅限主執行緒：把本輪補到的決標方式套回畫面，然後排下一輪。"""
+        self._trickle_busy = False
+        if result.get("ok"):
+            cache = core.load_award_cache(self.award_cache_path())
+            applied = core.apply_award_cache(self.tenders_all, cache)
+            if applied:
+                self.refresh_datasets()
+            self._append_log(
+                f"🔄 背景補齊：本輪確認 {result['ok']} 筆決標方式，"
+                f"待確認尚餘 {result.get('remaining', 0)} 筆。")
+        self.schedule_trickle()
+
+    def refresh_datasets(self):
+        """
+        僅限主執行緒：資料的決標方式變動後，重算兩份精選並重繪表格。
+
+        精選的成員資格會跟著變——一筆「公開取得 (待確認)」被確認成最有利標時，
+        就該從「最低標」精選中消失，不能只換掉那一格的文字。
+        排序方向與快速篩選文字都保留，使用者不必重按一次。
+        """
+        self.tenders_qualified = core.filter_tenders(
+            self.tenders_all, self.active_attr_target, self.active_award_target)
+        self.tenders_keyword_hits = core.filter_tenders(
+            self.tenders_all, self.active_attr_target, self.active_award_target,
+            require_keyword_hit=True)
+        self._apply_matched_dataset()
+        self.table_all.rows = self.tenders_all
+        self.notebook.tab(1, text=f" 📋 所有搜尋標案 ({len(self.tenders_all)} 筆) ")
+
+        for table in (self.table_matched, self.table_all):
+            table.resort()
+            table.render()
 
     # ==================== 搜尋流程 ====================
 
@@ -735,6 +892,7 @@ class PCCScraperApp(tb.Window):
         include_misses = self.include_misses()
 
         self.active_filter_label = self._describe_filter(target_attr, target_award)
+        self.active_attr_target = target_attr
         self.active_award_target = target_award
         self.save_settings()
 
@@ -747,8 +905,8 @@ class PCCScraperApp(tb.Window):
         self.status_badge.configure(text="搜尋中...", bootstyle="inverse-warning")
         self.progressbar.configure(value=0)
 
-        self.tree_matched.delete(*self.tree_matched.get_children())
-        self.tree_all.delete(*self.tree_all.get_children())
+        self.table_matched.clear()
+        self.table_all.clear()
 
         threading.Thread(
             target=self.run_scrape_thread,
@@ -794,12 +952,22 @@ class PCCScraperApp(tb.Window):
             hits = sum(1 for t in tenders_list if t.get("命中關鍵字群"))
             self.log(f"📦 掃描完畢，共 {len(tenders_list)} 筆不重複標案（其中 {hits} 筆命中關鍵字）。")
 
-            # 先套快取：過去確認過的標案不必再花官網那少得可憐的詳細頁額度
+            # 先套快取：過去確認過的標案不必再查一次
             cache_path = self.award_cache_path()
             cache = core.load_award_cache(cache_path)
             applied = core.apply_award_cache(tenders_list, cache)
             if applied:
-                self.log(f"♻️ 由快取套用 {applied} 筆先前已確認的官方決標方式（不花額度）。")
+                self.log(f"♻️ 由快取套用 {applied} 筆先前已確認的官方決標方式（不必重查）。")
+
+            # 待確認清單落地，背景涓流才有東西可撿——不必為了取得清單重跑整個全掃
+            pending_rows = core.select_rows_for_enrichment(
+                tenders_list, target_attr, target_award, limit=0,
+                require_keyword_hit=not include_misses)
+            if core.save_pending_queue(pending_rows, self.pending_queue_path()):
+                self.log(f"🗂️ 待確認清單已更新（{len(pending_rows)} 筆），背景會自動慢慢補齊。")
+            else:
+                self.log(f"  ⚠️ 無法寫入待確認清單 {self.pending_queue_path()}，"
+                         f"背景補齊會沒有東西可撿。")
 
             if self.cancel_event.is_set():
                 # 使用者按了停止：已抓到的照樣整理出來，但不再花時間連詳細頁
@@ -818,16 +986,17 @@ class PCCScraperApp(tb.Window):
 
                 if targets:
                     self.log(f"⚡ 從 {len(tenders_list)} 筆中挑出 {len(targets)} 筆尚未確認的候選，"
-                             f"連線官方詳細頁校驗真實決標方式...")
+                             f"校驗真實決標方式（主來源：公開資料鏡像）...")
                     stats = core.enrich_actual_award_methods(
                         targets, progress_cb=_on_progress, log=self.log,
                         cache=cache, cache_path=cache_path,
-                        should_stop=self.cancel_event.is_set)
+                        should_stop=self.cancel_event.is_set,
+                        use_mirror=USE_MIRROR_SOURCE)
                     if stats["blocked"]:
                         self._post("notice",
                                    f"官網詳細頁額度已用盡，本次只確認 {stats['ok']} 筆。"
                                    f"已確認的都寫進快取了，下次搜尋會直接套用。")
-                        self.log(f"⛔ 校驗提前中止：本次確認 {stats['ok']} 筆，官網額度已用盡。"
+                        self.log(f"⛔ 校驗提前中止：本次確認 {stats['ok']} 筆，官網詳細頁額度已用盡。"
                                  f"已確認的都已寫入快取，下次搜尋會直接套用。")
                     else:
                         self.log(f"✅ 校驗完成：本次確認 {stats['ok']}/{stats['total']} 筆，"
@@ -841,8 +1010,6 @@ class PCCScraperApp(tb.Window):
             self.tenders_qualified = core.filter_tenders(tenders_list, target_attr, target_award)
             self.tenders_keyword_hits = core.filter_tenders(
                 tenders_list, target_attr, target_award, require_keyword_hit=True)
-            self.tenders_matched = (self.tenders_qualified if include_misses
-                                    else self.tenders_keyword_hits)
             self.tenders_by_pk = {t["pk"]: t for t in tenders_list}
 
             self.log(f"🎯 符合【{target_attr} + {target_award}】共 {len(self.tenders_qualified)} 筆，"
@@ -852,8 +1019,9 @@ class PCCScraperApp(tb.Window):
             if pending:
                 self.log(f"⚠️ 精選中有 {pending} 筆決標方式仍是「公開取得 (待確認)」（橘色列）——"
                          f"官網搜尋結果頁看不出決標方式，實測這類標案有相當比例其實是最有利標。"
-                         f"詳細頁每輪只給約 {core.CAPTCHA_STREAK_LIMIT} 筆額度，無法一次查完；"
-                         f"每次搜尋會自動補幾筆進快取，要立刻確認某一筆請雙擊該列到官方頁面查看。")
+                         f"背景會持續補進快取（每 {core.DEFAULT_TRICKLE_INTERVAL_SECONDS // 60} 分鐘一輪、"
+                         f"每輪 {core.DEFAULT_TRICKLE_BATCH} 筆），"
+                         f"要立刻確認某一筆請雙擊該列到官方頁面查看。")
                 self._post("notice",
                            f"精選中有 {pending} 筆決標方式是推估的（橘色列），"
                            f"這類「公開取得」標案有相當比例其實是最有利標——投標前請雙擊該列確認。")
@@ -884,10 +1052,12 @@ class PCCScraperApp(tb.Window):
         self.progressbar.configure(value=100)
 
         self._apply_matched_dataset()
+        self.table_all.rows = self.tenders_all
         self.notebook.tab(1, text=f" 📋 所有搜尋標案 ({len(self.tenders_all)} 筆) ")
 
-        self.filter_treeview(self.tree_matched, "", is_matched=True)
-        self.filter_treeview(self.tree_all, "", is_matched=False)
+        for table in (self.table_matched, self.table_all):
+            table.clear_query()
+            table.render()
 
         headline = "已停止" if cancelled else "搜尋全部完成"
         self._append_log(
@@ -901,6 +1071,8 @@ class PCCScraperApp(tb.Window):
                  f"　·　F5 重新搜尋　·　Ctrl+F 篩選　·　Ctrl+E 匯出"
         )
         self.auto_export_backup()
+        # 搜尋剛跑完一批校驗，等一個間隔再開始背景補齊
+        self.schedule_trickle()
 
     def on_scrape_failed(self, err_msg):
         self.is_running = False

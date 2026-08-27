@@ -30,3 +30,31 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v
+
+  gui:
+    # GUI 測試會真的建立 Tk 視窗，先前只能在本機以 PCC_GUI_TESTS=1 手動跑，
+    # 等於 CI 完全沒守到；用 xvfb 給一個虛擬顯示器就能一起納入把關。
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl pytest ttkbootstrap
+
+      - name: Run GUI tests under a virtual display
+        env:
+          PCC_GUI_TESTS: "1"
+        run: xvfb-run -a python -m pytest tests/test_app_gui.py -v

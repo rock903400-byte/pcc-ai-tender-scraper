@@ -6,6 +6,8 @@ pcc_core 的離線單元測試。
 完全不連線政府採購網。
 """
 
+from datetime import date, timedelta
+
 import pytest
 
 import pcc_core as core
@@ -378,7 +380,7 @@ class TestDetailPage:
         monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
         monkeypatch.setattr(core, "fetch_award_method_status",
                             lambda pk: ("最低標", "ok") if pk == rows[0]["pk"] else ("", "error"))
-        core.enrich_actual_award_methods(rows, max_workers=2)
+        core.enrich_actual_award_methods(rows)
 
         assert rows[0]["決標方式來源"] == core.AWARD_SOURCE_OFFICIAL
         assert all(r["決標方式來源"] == core.AWARD_SOURCE_ESTIMATED for r in rows[1:])
@@ -390,13 +392,14 @@ class TestDetailPage:
         tenders = [{"pk": "a", "招標方式": "公開招標", "是否為勞務類": "是"},
                    {"pk": "b", "招標方式": "公開招標", "是否為勞務類": "是"}]
         messages = []
-        stats = core.enrich_actual_award_methods(tenders, max_workers=2, log=messages.append)
-        assert stats == {"total": 2, "done": 2, "ok": 1, "blocked": False}
+        stats = core.enrich_actual_award_methods(tenders, log=messages.append)
+        assert stats == {"total": 2, "done": 2, "ok": 1, "blocked": False,
+                         "mirror_ok": 0, "official_ok": 1}
         assert any("1 筆" in m and "沒有決標方式欄位" in m for m in messages)
 
     def test_enrich_distinguishes_blocked_from_missing(self, monkeypatch):
         """
-        「被驗證碼擋下」稍後重試就拿得到，「詳細頁沒這個欄位」重試幾次都一樣。
+        「被限流擋下」稍後重試就拿得到，「公告沒這個欄位」重試幾次都一樣。
         兩者混為一談會讓使用者不知道還該不該再試。
         """
         monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
@@ -405,9 +408,9 @@ class TestDetailPage:
         tenders = [{"pk": "a", "招標方式": "公開招標", "是否為勞務類": "是"},
                    {"pk": "b", "招標方式": "公開招標", "是否為勞務類": "是"}]
         messages = []
-        core.enrich_actual_award_methods(tenders, max_workers=1, log=messages.append)
+        core.enrich_actual_award_methods(tenders, log=messages.append)
 
-        assert any("驗證碼防護擋下" in m and "1 筆" in m for m in messages)
+        assert any("限流擋下" in m and "1 筆" in m for m in messages)
         assert any("沒有決標方式欄位" in m and "1 筆" in m for m in messages)
 
     def test_enrich_stops_when_blocked_by_captcha(self, monkeypatch):
@@ -421,13 +424,17 @@ class TestDetailPage:
                     "決標方式來源": core.AWARD_SOURCE_ESTIMATED}
                    for i in range(30)]
         messages = []
-        stats = core.enrich_actual_award_methods(tenders, max_workers=1, log=messages.append)
+        stats = core.enrich_actual_award_methods(tenders, log=messages.append)
 
         assert stats["blocked"] is True
         assert stats["ok"] == 0
-        assert stats["done"] == len(tenders)
+        # done 計的是【真的送出去的請求】，不是走過的筆數；否則收手後訊息會說
+        # 「剩餘 0 筆維持推估」，與實際上還有 25 筆沒查完完全相反。
+        assert stats["done"] == core.CAPTCHA_STREAK_LIMIT
         assert all(t["決標方式來源"] == core.AWARD_SOURCE_ESTIMATED for t in tenders)
         assert any("額度已用盡" in m for m in messages)
+        assert any(f"剩餘 {len(tenders) - core.CAPTCHA_STREAK_LIMIT} 筆" in m
+                   for m in messages)
 
     def test_enrich_makes_no_further_requests_after_quota_runs_out(self, monkeypatch):
         """
@@ -444,7 +451,7 @@ class TestDetailPage:
         monkeypatch.setattr(core, "fetch_award_method_status", _fake)
         tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"}
                    for i in range(30)]
-        core.enrich_actual_award_methods(tenders, max_workers=1)
+        core.enrich_actual_award_methods(tenders)
 
         assert len(calls) == core.CAPTCHA_STREAK_LIMIT
 
@@ -456,7 +463,7 @@ class TestDetailPage:
             lambda pk: ("", "blocked") if int(pk) % 2 else ("最低標", "ok"))
         tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"}
                    for i in range(20)]
-        stats = core.enrich_actual_award_methods(tenders, max_workers=1)
+        stats = core.enrich_actual_award_methods(tenders)
         assert stats["blocked"] is False
         assert stats["ok"] == 10
 
@@ -465,7 +472,7 @@ class TestDetailPage:
         monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
         tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"} for i in range(10)]
         seen = []
-        core.enrich_actual_award_methods(tenders, max_workers=4,
+        core.enrich_actual_award_methods(tenders,
                                          progress_cb=lambda d, t: seen.append((d, t)))
         assert sorted(d for d, _ in seen) == list(range(1, 11))
         assert all(t == 10 for _, t in seen)
@@ -867,7 +874,7 @@ class TestAwardCache:
         rows = [self._row(f"A{i}") for i in range(30)]
         path = core.award_cache_path(str(tmp_path))
         cache = {}
-        stats = core.enrich_actual_award_methods(rows, max_workers=1,
+        stats = core.enrich_actual_award_methods(rows,
                                                  cache=cache, cache_path=path)
 
         assert stats["blocked"] is True
@@ -929,7 +936,7 @@ class TestCancellation:
         monkeypatch.setattr(core, "fetch_award_method_status", _fake)
         tenders = [{"pk": str(i), "招標方式": "公開招標", "是否為勞務類": "是"}
                    for i in range(20)]
-        stats = core.enrich_actual_award_methods(tenders, max_workers=1,
+        stats = core.enrich_actual_award_methods(tenders,
                                                  should_stop=lambda: stop["now"])
 
         assert len(calls) == 3
@@ -980,3 +987,336 @@ class TestKeywordHitFiltering:
             row["招標方式"] = "公開招標"
         picked = core.select_rows_for_enrichment(rows, "勞務", "最低標", require_keyword_hit=True)
         assert [r["標案名稱"] for r in picked] == ["智慧路燈維護案"]
+
+
+# ==================== 巢狀表格 ====================
+
+class TestNestedTables:
+    """
+    先前以 `<tr[^>]*>(.*?)</tr>` 切列，遇到儲存格內還有一層 table 時，
+    外層列會被【內層的 </tr> 提早切斷】，後面的欄位整批錯位或整列被丟掉。
+    """
+
+    NESTED = ("<table><tr><td>甲</td>"
+              "<td><table><tr><td>內層</td></tr></table></td>"
+              "<td>丙</td></tr></table>")
+
+    def test_outer_row_keeps_every_cell(self):
+        rows = core.iter_table_rows(self.NESTED)
+        outer = [r for r in rows if r["depth"] == 1]
+        assert len(outer) == 1
+        assert len(outer[0]["cells"]) == 3, "外層列不該被內層的 </tr> 切斷"
+        assert core.strip_tags(outer[0]["cells"][2]) == "丙"
+
+    def test_inner_row_is_reported_separately(self):
+        inner = [r for r in core.iter_table_rows(self.NESTED) if r["depth"] == 2]
+        assert [core.strip_tags(c) for c in inner[0]["cells"]] == ["內層"]
+
+    def test_rows_follow_document_order(self):
+        html = "<table><tr><td>一</td></tr><tr><td>二</td></tr><tr><td>三</td></tr></table>"
+        rows = core.iter_table_rows(html)
+        assert [core.strip_tags(r["cells"][0]) for r in rows] == ["一", "二", "三"]
+
+    def test_header_and_data_cells_are_distinguished(self):
+        html = "<table><tr><th>標題</th></tr><tr><td>內容</td></tr></table>"
+        rows = core.iter_table_rows(html)
+        assert rows[0]["tags"] == ["th"]
+        assert rows[1]["tags"] == ["td"]
+
+    def test_missing_close_tags_do_not_break_parsing(self):
+        """站方漏掉 </td> / </tr> 時要同層自動收尾，不能整份解析崩掉。"""
+        html = "<table><tr><td>甲<td>乙<tr><td>丙</table>"
+        rows = core.iter_table_rows(html)
+        assert [core.strip_tags(c) for c in rows[0]["cells"]] == ["甲", "乙"]
+        assert [core.strip_tags(c) for c in rows[1]["cells"]] == ["丙"]
+
+    def test_real_rows_still_parse_after_wrapping_in_a_nested_table(self, search_html):
+        """把真實搜尋結果整個包進另一層 table，解析結果必須完全一樣。"""
+        plain = core.parse_tender_rows(search_html, "AI")
+        wrapped = core.parse_tender_rows(
+            "<table><tr><td>" + search_html + "</td></tr></table>", "AI")
+        assert [r["標案案號"] for r in wrapped] == [r["標案案號"] for r in plain]
+
+
+# ==================== 驗證碼的結構性判斷 ====================
+
+class TestCaptchaStructuralDetection:
+    """
+    字串比對是站方換文案就靜默失效的那種偵測：我們會把驗證碼頁當成「查無資料」，
+    使用者只看到 0 筆而不知道自己被擋了。表單結構是比較不會變的後盾。
+    """
+
+    def test_detects_validate_form_with_unknown_wording(self):
+        html = ("<html><body><h1>Security Check</h1>"
+                "<form id=\"f\" action=\"/tps/validate/check\" method=\"post\"></form>"
+                "</body></html>")
+        assert core.is_captcha_page(html) is True
+
+    def test_detects_validate_code_input(self):
+        html = "<html><form><input type=\"text\" name=\"validateCode\" /></form></html>"
+        assert core.is_captcha_page(html) is True
+
+    def test_normal_search_page_is_not_flagged(self, search_html):
+        assert core.is_captcha_page(search_html) is False
+
+    def test_normal_detail_page_is_not_flagged(self, detail_html):
+        assert core.is_captcha_page(detail_html) is False
+
+
+# ==================== 快取有效期 ====================
+
+class TestAwardCacheTTL:
+    """
+    更正公告會改動決標方式。「一次確認、永久相信」遲早會拿舊答案餵給使用者，
+    而且比「待確認」更危險——後者至少畫成橘色提醒使用者自己去看。
+    """
+
+    @staticmethod
+    def _row(tender_id="A1"):
+        return {"pk": "pk-" + tender_id, "標案案號": tender_id,
+                "招標方式": "公開取得報價單或企劃書", "採購性質": "勞務類",
+                "決標方式": "公開取得 (待確認)",
+                "決標方式來源": core.AWARD_SOURCE_ESTIMATED,
+                "是否為勞務類": "是", "是否為最低標": "是"}
+
+    @staticmethod
+    def _entry(days_ago, award="最低標"):
+        stamp = date.today() - timedelta(days=days_ago)
+        return {"決標方式": award, "pk": "pk-A1", "verified_at": stamp.isoformat()}
+
+    def test_fresh_entry_is_applied(self):
+        rows = [self._row()]
+        assert core.apply_award_cache(rows, {"A1": self._entry(1)}) == 1
+        assert core.is_award_confirmed(rows[0])
+
+    def test_expired_entry_is_ignored(self):
+        rows = [self._row()]
+        stale = {"A1": self._entry(core.AWARD_CACHE_TTL_DAYS + 1)}
+        assert core.apply_award_cache(rows, stale) == 0
+        assert not core.is_award_confirmed(rows[0])
+        assert rows[0]["決標方式"] == "公開取得 (待確認)"
+
+    def test_entry_exactly_on_the_boundary_still_counts(self):
+        rows = [self._row()]
+        entry = {"A1": self._entry(core.AWARD_CACHE_TTL_DAYS)}
+        assert core.apply_award_cache(rows, entry) == 1
+
+    def test_legacy_entries_without_timestamp_are_kept(self):
+        """早期版本寫的純字串條目沒有時間戳，不該因為升級就整批失效。"""
+        rows = [self._row()]
+        assert core.apply_award_cache(rows, {"A1": "最低標"}) == 1
+
+    def test_unparseable_timestamp_is_treated_as_fresh(self):
+        rows = [self._row()]
+        entry = {"決標方式": "最低標", "verified_at": "not-a-date"}
+        assert core.apply_award_cache(rows, {"A1": entry}) == 1
+
+    def test_expired_rows_go_back_into_the_verification_queue(self):
+        """過期就該重新排隊去查，否則永遠拿著舊答案。"""
+        rows = [self._row()]
+        core.apply_award_cache(rows, {"A1": self._entry(core.AWARD_CACHE_TTL_DAYS + 1)})
+        picked = core.select_rows_for_enrichment(rows, "勞務", "最低標")
+        assert [r["標案案號"] for r in picked] == ["A1"]
+
+    def test_prune_drops_only_expired_entries(self):
+        cache = {"A1": self._entry(1), "A2": self._entry(core.AWARD_CACHE_TTL_DAYS + 5)}
+        assert core.prune_award_cache(cache) == 1
+        assert list(cache) == ["A1"]
+
+
+# ==================== 待確認佇列 ====================
+
+class TestPendingQueue:
+    """背景涓流校驗靠這個檔案知道「還有哪些要查」，不必為了拿清單重跑整個全掃。"""
+
+    @staticmethod
+    def _row(tender_id):
+        return {"pk": "pk-" + tender_id, "標案案號": tender_id,
+                "標案名稱": tender_id + " 案", "招標機關": "某機關",
+                "招標方式": "公開取得報價單或企劃書"}
+
+    def test_round_trip(self, tmp_path):
+        path = core.pending_queue_path(str(tmp_path))
+        assert core.save_pending_queue([self._row("A1"), self._row("A2")], path) is True
+        rows = core.load_pending_queue(path)
+        assert sorted(r["標案案號"] for r in rows) == ["A1", "A2"]
+        assert all(r["pk"].startswith("pk-") for r in rows)
+
+    def test_rows_without_pk_are_skipped(self, tmp_path):
+        """沒有 pk 就連不了詳細頁，留在佇列裡只會每輪浪費一次額度。"""
+        path = core.pending_queue_path(str(tmp_path))
+        bad = self._row("A9")
+        del bad["pk"]
+        core.save_pending_queue([self._row("A1"), bad], path)
+        assert [r["標案案號"] for r in core.load_pending_queue(path)] == ["A1"]
+
+    def test_already_cached_rows_are_filtered_out(self, tmp_path):
+        path = core.pending_queue_path(str(tmp_path))
+        core.save_pending_queue([self._row("A1"), self._row("A2")], path)
+        cache = {"A1": {"決標方式": "最低標", "verified_at": date.today().isoformat()}}
+        assert [r["標案案號"] for r in core.load_pending_queue(path, cache)] == ["A2"]
+
+    def test_expired_cache_entries_go_back_into_the_queue(self, tmp_path):
+        path = core.pending_queue_path(str(tmp_path))
+        core.save_pending_queue([self._row("A1")], path)
+        stale = date.today() - timedelta(days=core.AWARD_CACHE_TTL_DAYS + 1)
+        cache = {"A1": {"決標方式": "最低標", "verified_at": stale.isoformat()}}
+        assert [r["標案案號"] for r in core.load_pending_queue(path, cache)] == ["A1"]
+
+    def test_priority_order_survives_the_round_trip(self, tmp_path):
+        """
+        JSON 以案號排序存放，不另外記順序的話取件會變成字母序（A0, A1, A10, A11, A2…），
+        額度就先花在早已過了等標期的舊案上。呼叫端給的順序才是優先順序。
+        """
+        path = core.pending_queue_path(str(tmp_path))
+        core.save_pending_queue([self._row("A10"), self._row("A2"), self._row("A1")], path)
+        assert [r["標案案號"] for r in core.load_pending_queue(path)] == ["A10", "A2", "A1"]
+
+    def test_missing_file_is_an_empty_queue(self, tmp_path):
+        assert core.load_pending_queue(str(tmp_path / "nope.json")) == []
+
+    def test_corrupt_file_is_an_empty_queue(self, tmp_path):
+        path = tmp_path / "pending_queue.json"
+        path.write_text("{ not json", encoding="utf-8")
+        assert core.load_pending_queue(str(path)) == []
+
+
+# ==================== 背景涓流校驗 ====================
+
+class TestTrickleVerify:
+    """
+    補完待確認清單靠的是每輪撿一批、跨輪累積。
+    每一輪都要能獨立跑完並把成果落地，中途被擋也不能把佇列弄丟。
+    """
+
+    @staticmethod
+    def _seed(tmp_path, count=12):
+        queue_path = core.pending_queue_path(str(tmp_path))
+        rows = [{"pk": "pk-A%d" % i, "標案案號": "A%d" % i, "標案名稱": "第 %d 案" % i,
+                 "招標機關": "某機關", "招標方式": "公開取得報價單或企劃書"}
+                for i in range(count)]
+        core.save_pending_queue(rows, queue_path)
+        return core.award_cache_path(str(tmp_path)), queue_path
+
+    def test_one_round_only_takes_a_small_batch(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        calls = []
+
+        def _fake(pk):
+            calls.append(pk)
+            return "最低標", "ok"
+
+        monkeypatch.setattr(core, "fetch_award_method_status", _fake)
+        cache_path, queue_path = self._seed(tmp_path)
+        result = core.trickle_verify(cache_path, queue_path, batch=5)
+
+        assert len(calls) == 5, "一輪就該收手，不要硬啃整份清單"
+        assert result["ok"] == 5
+
+    def test_default_batch_matches_the_mirror_throughput(self, monkeypatch, tmp_path):
+        """
+        預設批量跟著主來源走：鏡像沒有官網那種 5 筆/輪的額度，
+        還把每輪壓在 5 筆，待確認清單只會愈積愈多。
+        """
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
+        cache_path, queue_path = self._seed(tmp_path, count=core.DEFAULT_TRICKLE_BATCH + 7)
+
+        result = core.trickle_verify(cache_path, queue_path)
+
+        assert result["picked"] == core.DEFAULT_TRICKLE_BATCH
+        assert result["remaining"] == 7
+
+    def test_confirmed_rows_leave_the_queue_and_land_in_the_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
+        cache_path, queue_path = self._seed(tmp_path, count=12)
+
+        result = core.trickle_verify(cache_path, queue_path, batch=5)
+
+        assert len(core.load_award_cache(cache_path)) == 5
+        assert result["remaining"] == 12 - 5
+        assert len(core.load_pending_queue(queue_path)) == 12 - 5
+
+    def test_rounds_accumulate_across_calls(self, monkeypatch, tmp_path):
+        """這是整個設計的重點：跨次執行慢慢累積，而不是每次歸零。"""
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
+        cache_path, queue_path = self._seed(tmp_path, count=12)
+
+        confirmed = []
+        for _ in range(3):
+            confirmed.append(core.trickle_verify(cache_path, queue_path, batch=5)["ok"])
+
+        # 12 筆分三輪撿完：5 + 5 + 2，最後一輪只剩 2 筆可撿
+        assert confirmed == [5, 5, 2]
+        assert len(core.load_award_cache(cache_path)) == 12
+        assert len(core.load_pending_queue(queue_path)) == 0
+
+    def test_blocked_round_keeps_the_queue_intact(self, monkeypatch, tmp_path):
+        """被擋下時什麼都沒確認到，佇列就該原封不動留給下一輪。"""
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("", "blocked"))
+        cache_path, queue_path = self._seed(tmp_path, count=12)
+
+        result = core.trickle_verify(cache_path, queue_path)
+
+        assert result["blocked"] is True
+        assert result["ok"] == 0
+        assert len(core.load_pending_queue(queue_path)) == 12
+
+    def test_empty_queue_makes_no_requests(self, monkeypatch, tmp_path):
+        def _boom(pk):
+            raise AssertionError("佇列是空的就不該連線")
+
+        monkeypatch.setattr(core, "fetch_award_method_status", _boom)
+        result = core.trickle_verify(core.award_cache_path(str(tmp_path)),
+                                     core.pending_queue_path(str(tmp_path)))
+        assert result == {"picked": 0, "ok": 0, "blocked": False, "remaining": 0}
+
+    def test_stop_callback_is_honoured(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
+        cache_path, queue_path = self._seed(tmp_path)
+        result = core.trickle_verify(cache_path, queue_path, should_stop=lambda: True)
+        assert result["ok"] == 0
+
+
+# ==================== 寫檔失敗的可見性 ====================
+
+class TestWriteFailuresAreReported:
+    """
+    決標方式的累積策略成敗全繫於這個寫入。先前這裡靜默吞掉 OSError，
+    磁碟滿了或資料夾唯讀時，使用者會以為一切正常，實際上什麼都沒存下來。
+    """
+
+    def test_successful_write_returns_true(self, tmp_path):
+        assert core.save_json_dict({"a": 1}, str(tmp_path / "x.json")) is True
+
+    def test_failed_write_returns_false(self, monkeypatch, tmp_path):
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(core.os, "replace", _boom)
+        assert core.save_json_dict({"a": 1}, str(tmp_path / "x.json")) is False
+
+    def test_failed_cache_write_is_logged(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(core, "DETAIL_DELAY_RANGE", (0, 0))
+        monkeypatch.setattr(core, "fetch_award_method_status", lambda pk: ("最低標", "ok"))
+        monkeypatch.setattr(core, "save_award_cache", lambda cache, path: False)
+        messages = []
+        rows = [{"pk": "pk-A1", "標案案號": "A1", "招標方式": "公開招標",
+                 "是否為勞務類": "是"}]
+        core.enrich_actual_award_methods(rows, log=messages.append, cache={},
+                                         cache_path=str(tmp_path / "c.json"))
+        assert any("無法寫入決標方式快取" in m for m in messages)
+
+    def test_original_file_survives_a_failed_write(self, tmp_path):
+        """先寫暫存檔再 os.replace：寫壞了也不該毀掉上一次的成果。"""
+        path = str(tmp_path / "cache.json")
+        core.save_json_dict({"good": 1}, path)
+        try:
+            core.save_json_dict({"bad": object()}, path)  # 不可序列化
+        except TypeError:
+            pass
+        assert core.load_json_dict(path) == {"good": 1}

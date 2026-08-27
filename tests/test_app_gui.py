@@ -16,6 +16,7 @@ CI（無顯示環境的 Linux runner）僅執行該部分。
 
 import os
 import webbrowser
+from datetime import date
 
 import pytest
 
@@ -65,11 +66,12 @@ def window(app_window):
     app_window.tenders_all = [dict(t) for t in SAMPLE]
     app_window.tenders_matched = app_window.tenders_all[:1]
     app_window.tenders_by_pk = {t["pk"]: t for t in app_window.tenders_all}
-    app_window.sort_state_all = {"col": None, "reverse": False}
-    app_window.sort_state_matched = {"col": None, "reverse": False}
+    app_window.table_all.rows = app_window.tenders_all
+    app_window.table_all.sort_state = {"col": None, "reverse": False}
+    app_window.table_matched.sort_state = {"col": None, "reverse": False}
     for col_id, name, _w, _a, _f in gui.COLUMNS_CONFIG:
-        app_window.tree_all.heading(col_id, text=name)
-        app_window.tree_matched.heading(col_id, text=name)
+        app_window.table_all.tree.heading(col_id, text=name)
+        app_window.table_matched.tree.heading(col_id, text=name)
     app_window.hide_pending_var.set(False)
     app_window.active_award_target = "最低標"
     # 搜尋條件是模組共用視窗上的狀態，每個測試前要回到預設值
@@ -80,7 +82,7 @@ def window(app_window):
     app_window.award_combo.set("最低標")
     app_window.verify_var.set(True)
     app_window.include_misses_var.set(False)
-    for entry in (app_window.filter_entry_all, app_window.filter_entry_matched):
+    for entry in (app_window.table_all.entry, app_window.table_matched.entry):
         entry.delete(0, "end")
     # 佇列裡若殘留上個測試的 "failed"，會在別的測試 drain 時彈出 modal
     # 對話框而讓整個測試程序卡死——每個測試前一定要倒乾淨。
@@ -90,14 +92,25 @@ def window(app_window):
     app_window.cancel_event.clear()
     app_window.clear_notices()
     # 快取與設定都是跨次執行的持久檔，測試之間必須清乾淨才不會互相汙染
-    for path in (app_window.award_cache_path(), app_window.settings_path()):
+    app_window.cancel_trickle()
+    app_window._trickle_busy = False
+    app_window.trickle_var.set(True)
+    for path in (app_window.award_cache_path(), app_window.settings_path(),
+                 app_window.pending_queue_path()):
         try:
             os.remove(path)
         except OSError:
             pass
-    app_window.filter_treeview(app_window.tree_all, "", is_matched=False)
+    app_window.table_all.render()
     return app_window
 
+
+
+def set_query(table, text):
+    """把快速篩選框設成 text 並重畫——使用者實際上就是這樣操作的。"""
+    table.entry.delete(0, "end")
+    table.entry.insert(0, text)
+    table.render()
 
 def pending_row(pk, tender_id, name="待確認案"):
     """招標方式為「公開取得」時，搜尋結果頁看不出決標方式，只能推估。"""
@@ -127,11 +140,11 @@ def test_default_keywords_come_from_config(window):
 
 
 def test_rows_use_pk_as_item_id(window):
-    assert list(window.tree_all.get_children()) == ["PK1", "PK2"]
+    assert list(window.table_all.tree.get_children()) == ["PK1", "PK2"]
 
 
 def test_row_values_cover_every_column(window):
-    values = window.tree_all.item("PK1", "values")
+    values = window.table_all.tree.item("PK1", "values")
     assert len(values) == len(gui.COLUMNS_CONFIG)
     assert core.AWARD_SOURCE_OFFICIAL in values
 
@@ -140,14 +153,14 @@ def test_duplicate_titles_still_resolve_to_distinct_links(window):
     """迴歸測試：兩筆標案同名時，開啟連結不可再靠標案名稱比對。"""
     for tender in window.tenders_all:
         tender["標案名稱"] = "同名標案"
-    window.filter_treeview(window.tree_all, "", is_matched=False)
+    window.table_all.clear_query() or window.table_all.render()
 
     opened = []
     original = webbrowser.open
     webbrowser.open = opened.append
     try:
-        window.tree_all.selection_set("PK2")
-        window.open_selected_link(window.tree_all)
+        window.table_all.tree.selection_set("PK2")
+        window.table_all.open_selected()
     finally:
         webbrowser.open = original
 
@@ -155,32 +168,32 @@ def test_duplicate_titles_still_resolve_to_distinct_links(window):
 
 
 def test_filter_matches_org(window):
-    window.filter_treeview(window.tree_all, "機關乙", is_matched=False)
-    assert list(window.tree_all.get_children()) == ["PK2"]
-    window.filter_treeview(window.tree_all, "", is_matched=False)
-    assert len(window.tree_all.get_children()) == 2
+    set_query(window.table_all, "機關乙")
+    assert list(window.table_all.tree.get_children()) == ["PK2"]
+    window.table_all.clear_query() or window.table_all.render()
+    assert len(window.table_all.tree.get_children()) == 2
 
 
 def test_budget_sorts_numerically(window):
     """字串排序會把 9,000 排在 21,000,000 之後，數值排序不會。"""
-    window.on_sort_column(window.tree_all, "budget", is_matched=False)
+    window.table_all.sort_by("budget")
     assert [t["標案案號"] for t in window.tenders_all] == ["A2", "A1"]
-    window.on_sort_column(window.tree_all, "budget", is_matched=False)
+    window.table_all.sort_by("budget")
     assert [t["標案案號"] for t in window.tenders_all] == ["A1", "A2"]
 
 
 def test_sort_indicator_shown_on_active_column_only(window):
-    window.on_sort_column(window.tree_all, "org", is_matched=False)
-    assert window.tree_all.heading("org", "text").endswith("▲")
-    assert window.tree_all.heading("title", "text") == "標案名稱"
+    window.table_all.sort_by("org")
+    assert window.table_all.tree.heading("org", "text").endswith("▲")
+    assert window.table_all.tree.heading("title", "text") == "標案名稱"
 
 
 def test_sorting_preserves_active_filter(window):
-    window.filter_entry_all.delete(0, "end")
-    window.filter_entry_all.insert(0, "機關乙")
-    window.on_sort_column(window.tree_all, "org", is_matched=False)
-    assert list(window.tree_all.get_children()) == ["PK2"]
-    window.filter_entry_all.delete(0, "end")
+    window.table_all.entry.delete(0, "end")
+    window.table_all.entry.insert(0, "機關乙")
+    window.table_all.sort_by("org")
+    assert list(window.table_all.tree.get_children()) == ["PK2"]
+    window.table_all.entry.delete(0, "end")
 
 
 def test_log_from_worker_thread_reaches_widget(window):
@@ -262,6 +275,9 @@ def test_scrape_scans_everything_and_only_tags_keywords(window, monkeypatch):
     assert sorted(t["標案案號"] for t in window.tenders_all) == ["A8", "MY115007"]
     assert [t["標案案號"] for t in window.tenders_qualified] == ["MY115007", "A8"]
     assert [t["標案案號"] for t in window.tenders_keyword_hits] == ["MY115007"]
+    # 「顯示哪一份精選」是主執行緒的決定（背景執行緒不該碰畫面狀態），
+    # 所以要走完 _apply_matched_dataset 才看得到結果
+    window._apply_matched_dataset()
     assert [t["標案案號"] for t in window.tenders_matched] == ["MY115007"]
 
 
@@ -281,7 +297,7 @@ def test_精選_toggle_switches_dataset_and_title(window, monkeypatch):
     window.on_include_misses_toggled()
     assert [t["標案案號"] for t in window.tenders_matched] == ["A1", "A2"]
     assert "2 筆" in window.notebook.tab(0, "text")
-    assert list(window.tree_matched.get_children()) == ["PK1", "PK2"]
+    assert list(window.table_matched.tree.get_children()) == ["PK1", "PK2"]
 
 
 def test_精選_toggle_keeps_sort_and_filter(window):
@@ -291,22 +307,22 @@ def test_精選_toggle_keeps_sort_and_filter(window):
 
     window.include_misses_var.set(True)
     window.on_include_misses_toggled()
-    window.on_sort_column(window.tree_matched, "budget", is_matched=True)
+    window.table_matched.sort_by("budget")
     assert [t["標案案號"] for t in window.tenders_matched] == ["A2", "A1"]
 
-    window.filter_entry_matched.delete(0, "end")
-    window.filter_entry_matched.insert(0, "機關乙")
+    window.table_matched.entry.delete(0, "end")
+    window.table_matched.entry.insert(0, "機關乙")
     window.include_misses_var.set(False)
     window.on_include_misses_toggled()
 
     assert [t["標案案號"] for t in window.tenders_matched] == ["A2", "A1"]
-    assert list(window.tree_matched.get_children()) == ["PK2"]
+    assert list(window.table_matched.tree.get_children()) == ["PK2"]
 
 
 def test_rows_without_keyword_hits_are_marked_in_the_table(window):
     window.tenders_all[0]["命中關鍵字"] = ""
-    window.filter_treeview(window.tree_all, "", is_matched=False)
-    values = window.tree_all.item("PK1", "values")
+    window.table_all.clear_query() or window.table_all.render()
+    values = window.table_all.tree.item("PK1", "values")
     assert values[-1] == "—"
 
 
@@ -355,19 +371,19 @@ def test_hide_pending_toggle_only_hides_unconfirmed(window):
     window.tenders_matched = [confirmed, pending]
 
     window.hide_pending_var.set(False)
-    window.filter_treeview(window.tree_matched, "", is_matched=True)
-    assert list(window.tree_matched.get_children()) == ["PK1", "PK3"]
+    window.table_matched.clear_query() or window.table_matched.render()
+    assert list(window.table_matched.tree.get_children()) == ["PK1", "PK3"]
 
     window.hide_pending_var.set(True)
-    window.on_hide_pending_toggled()
-    assert list(window.tree_matched.get_children()) == ["PK1"]
+    window.table_matched.render()
+    assert list(window.table_matched.tree.get_children()) == ["PK1"]
 
 
 def test_table_stays_single_select(window):
     """
     介面上沒有需要複選的動作，維持單選才不會讓使用者以為選了一批就能做什麼。
     """
-    for tree in (window.tree_matched, window.tree_all):
+    for tree in (window.table_matched.tree, window.table_all.tree):
         assert str(tree.cget("selectmode")) == "browse"
 
 
@@ -577,9 +593,9 @@ def test_scrape_raises_notice_for_pending_rows(window, monkeypatch):
 
 def test_escape_clears_filter_when_idle(window):
     window.notebook.select(0)
-    window.filter_entry_matched.insert(0, "機關乙")
+    window.table_matched.entry.insert(0, "機關乙")
     window.on_escape()
-    assert window.filter_entry_matched.get() == ""
+    assert window.table_matched.entry.get() == ""
 
 
 def test_escape_cancels_while_running(window, monkeypatch):
@@ -618,3 +634,129 @@ def test_tooltip_marks_confirmed_rows_plainly(window):
     text = window.tooltip_text(tender)
     assert "推估值" not in text
     assert core.AWARD_SOURCE_OFFICIAL in text
+
+
+# ==================== 背景涓流校驗 ====================
+#
+# 一次搜尋只能免費撿走約 5 筆決標方式，補不完整份待確認清單。這組測試守的是
+# 「使用者什麼都不必做，橘色列會自己隨時間變少」這個承諾。
+
+
+def test_trickle_is_scheduled_after_a_search(window):
+    window.trickle_var.set(True)
+    window.cancel_trickle()
+    window.schedule_trickle()
+    assert window._trickle_job is not None
+
+
+def test_disabling_the_toggle_cancels_the_pending_round(window):
+    window.trickle_var.set(True)
+    window.schedule_trickle()
+    window.trickle_var.set(False)
+    window.on_trickle_toggled()
+    assert window._trickle_job is None
+
+
+def test_scheduling_while_disabled_does_nothing(window):
+    window.trickle_var.set(False)
+    window.schedule_trickle()
+    assert window._trickle_job is None
+    window.trickle_var.set(True)
+
+
+def test_only_one_round_is_ever_scheduled(window):
+    """重複排程不該堆出一串 after 任務，否則間隔會愈縮愈短、更快撞上額度。"""
+    window.trickle_var.set(True)
+    window.schedule_trickle()
+    first = window._trickle_job
+    window.schedule_trickle()
+    assert window._trickle_job != first
+    assert first not in window.tk.call("after", "info")
+
+
+def test_round_is_skipped_while_a_search_is_running(window, monkeypatch):
+    """背景補齊不該跟前景搜尋搶站方那點額度。"""
+    called = []
+    monkeypatch.setattr(core, "trickle_verify",
+                        lambda *a, **kw: called.append(1) or {"ok": 0})
+    window.trickle_var.set(True)
+    window.is_running = True
+    try:
+        window._start_trickle_round()
+    finally:
+        window.is_running = False
+    assert called == []
+    assert window._trickle_job is not None, "跳過的這輪要重新排，不能就此停擺"
+
+
+def test_confirmed_row_leaves_the_shortlist_after_a_round(window):
+    """
+    整個設計的重點：一筆「公開取得 (待確認)」被背景確認成最有利標時，
+    要從「最低標」精選中【消失】，不能只換掉那一格的文字。
+    """
+    pending = pending_row("PK9", "A9", "待確認的資訊系統案")
+    window.tenders_all = [pending]
+    window.tenders_by_pk = {"PK9": pending}
+    window.active_attr_target = "勞務"
+    window.active_award_target = "最低標"
+    window.include_misses_var.set(True)
+    window.refresh_datasets()
+    assert [t["標案案號"] for t in window.tenders_qualified] == ["A9"]
+
+    core.save_award_cache({"A9": {"決標方式": "最有利標",
+                                  "verified_at": date.today().isoformat()}},
+                          window.award_cache_path())
+    window.on_trickle_round_done({"ok": 1, "picked": 5, "blocked": False, "remaining": 3})
+
+    assert window.tenders_qualified == [], "已確認為最有利標的標案不該留在最低標精選"
+    assert core.is_award_confirmed(window.tenders_all[0])
+    assert "PK9" not in window.table_matched.tree.get_children()
+
+
+def test_round_without_results_leaves_the_table_alone(window):
+    before = list(window.table_all.tree.get_children())
+    window.on_trickle_round_done({"ok": 0, "picked": 5, "blocked": True, "remaining": 7})
+    assert list(window.table_all.tree.get_children()) == before
+    assert window._trickle_busy is False
+
+
+def test_refresh_preserves_sort_and_filter(window):
+    window.active_attr_target = "不限"
+    window.active_award_target = "不限"
+    window.table_all.sort_by("budget")
+    window.table_all.entry.delete(0, "end")
+    window.table_all.entry.insert(0, "機關乙")
+
+    window.refresh_datasets()
+
+    assert [t["標案案號"] for t in window.tenders_all] == ["A2", "A1"]
+    assert list(window.table_all.tree.get_children()) == ["PK2"]
+    window.table_all.entry.delete(0, "end")
+
+
+def test_worker_error_does_not_kill_the_app(window, monkeypatch):
+    """背景工作爆掉只該記一行 log，不能把整個應用程式帶走。"""
+    def _boom(*args, **kwargs):
+        raise RuntimeError("站方掛了")
+
+    monkeypatch.setattr(core, "trickle_verify", _boom)
+    window._trickle_worker()
+    window._drain_ui_queue()
+    window.update()
+    assert "背景補齊發生錯誤" in window.log_text.get("1.0", "end")
+
+
+def test_trickle_preference_survives_a_restart(window):
+    window.trickle_var.set(False)
+    window.save_settings()
+    window.trickle_var.set(True)
+    assert window.restore_settings() is True
+    assert window.trickle_var.get() is False
+    window.trickle_var.set(True)
+
+
+def test_settings_write_failure_is_logged(window, monkeypatch):
+    """設定存不下來時要講出來，否則使用者只會發現「條件又沒還原」卻查不到原因。"""
+    monkeypatch.setattr(core, "save_json_dict", lambda data, path: False)
+    window.save_settings()
+    assert "無法寫入搜尋條件" in window.log_text.get("1.0", "end")

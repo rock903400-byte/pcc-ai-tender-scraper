@@ -6,7 +6,6 @@ app.py (GUI) 與 crawler.py (CLI) 共用本模組，確保分頁、重試、驗�
 表頭欄位對照與決標方式判定等邏輯只有一份實作。
 """
 
-import concurrent.futures
 import csv
 import json
 import math
@@ -15,12 +14,13 @@ import random
 import re
 import socket
 import sys
-import threading
 import time
 import urllib.parse
 import urllib.request
 from datetime import date
 from http.cookiejar import CookieJar
+
+import pcc_mirror as mirror
 
 try:
     import pandas as pd
@@ -75,13 +75,14 @@ MAX_RANGE_DAYS = 186
 # 14 天約 2,900 筆 / 58 頁、30 天約 5,600 筆 / 112 頁，故上限訂在 120 頁（6,000 筆）。
 DEFAULT_MAX_PAGES = 120
 
-# 詳細頁校驗的節流設定。
+# 決標方式校驗的節流設定。
 #
-# 實測（2026-08）站方對詳細頁是【額度制而非頻率制】：連續請求約 5 筆成功後就會回
+# 官網詳細頁是【額度制而非頻率制】：實測（2026-08）連續請求約 5 筆成功後就會回
 # 「驗證碼檢核」頁，把間隔拉到 2 秒也一樣擋，冷卻是分鐘級且為 IP 層級（換 cookie 無效，
-# 靜置 15 分鐘也未必解除）。硬啃只會讓每次搜尋卡住卻補不了幾筆，因此這裡刻意單執行緒、
-# 低額度：每輪順手撿走免費的那幾筆寫進快取，靠跨次執行累積，被擋就收手。
-DEFAULT_VERIFY_LIMIT = 25
+# 靜置 15 分鐘也未必解除）。因此主來源改為 pcc_mirror 的公開資料鏡像 API
+# （同一批公告、含當日資料、實測約 30–40 筆/分鐘），官網詳細頁降為鏡像查不到時的備援。
+# 備援路徑仍維持單執行緒、低額度：撿走免費的那幾筆就收手，被擋不硬啃。
+DEFAULT_VERIFY_LIMIT = 60
 DETAIL_DELAY_RANGE = (1.0, 2.0)
 CAPTCHA_STREAK_LIMIT = 5
 
@@ -91,9 +92,21 @@ PAGE_DELAY = 0.8
 # 決標方式的資料來源，讓使用者一眼看出哪些列只是推估值
 AWARD_SOURCE_ESTIMATED = "依招標方式推估"
 AWARD_SOURCE_OFFICIAL = "官方詳細頁"
+AWARD_SOURCE_MIRROR = "公開資料鏡像"
+
+# 兩種來源都算「已由官方公告確認」——鏡像重新發布的就是同一份公告資料
+CONFIRMED_SOURCES = (AWARD_SOURCE_OFFICIAL, AWARD_SOURCE_MIRROR)
 
 # 已確認決標方式的永久快取檔名（放在輸出資料夾，.gitignore 已涵蓋）
 AWARD_CACHE_FILENAME = "award_cache.json"
+
+# 快取條目的有效天數。更正公告會改動決標方式，「一次確認、永久相信」遲早會拿舊答案
+# 餵給使用者；超過這個天數就當作沒確認過，重新排回待確認佇列。
+AWARD_CACHE_TTL_DAYS = 90
+
+# 待確認標案的佇列檔名。背景涓流校驗靠它拿到「還有哪些要查」，
+# 不必為了取得清單而重跑一次動輒上百頁的全面掃描。
+PENDING_QUEUE_FILENAME = "pending_queue.json"
 
 # GUI 上次使用的搜尋條件（關鍵字、日期模式、採購性質…），下次開啟自動還原
 SETTINGS_FILENAME = "ui_settings.json"
@@ -225,9 +238,20 @@ CAPTCHA_MARKERS = (
 )
 
 
+# 結構性特徵：站方換掉文案時，上面那組中文字串比對會【靜默失效】——
+# 我們會把驗證碼頁當成「查無資料」，使用者只看到 0 筆而不知道自己被擋了。
+# 驗證碼頁一定帶著一個送往 /tps/validate/ 的表單或 validateCode 欄位，改用這個當後盾。
+_VALIDATE_FORM_RE = re.compile(
+    r"""<form[^>]+action\s*=\s*["']?[^"'>]*/tps/validate/|"""
+    r"""<input[^>]+name\s*=\s*["']?validateCode""",
+    re.IGNORECASE)
+
+
 def is_captcha_page(html_doc: str) -> bool:
     """判斷回應是否為頻率防護的驗證碼頁。"""
-    return any(marker in html_doc for marker in CAPTCHA_MARKERS)
+    if any(marker in html_doc for marker in CAPTCHA_MARKERS):
+        return True
+    return bool(_VALIDATE_FORM_RE.search(html_doc))
 
 
 # ==================== HTML 解析 ====================
@@ -247,6 +271,83 @@ def strip_tags(fragment: str, drop_scripts: bool = True) -> str:
     for ent, rep in _ENTITIES.items():
         text = text.replace(ent, rep)
     return " ".join(text.split())
+
+
+# 表格結構的 token。用深度感知的掃描取代 `<tr[^>]*>(.*?)</tr>`：非貪婪 regex 碰到
+# 巢狀 table 時，外層列會被【內層的 </tr> 提早切斷】，剩下的欄位全部錯位或整列被丟掉。
+_TABLE_TOKEN_RE = re.compile(r"<\s*(/?)\s*(table|tr|td|th)\b[^>]*>", re.IGNORECASE)
+
+
+def iter_table_rows(html_doc: str) -> list:
+    """
+    掃出文件中所有表格列，回傳 [{"cells": [儲存格原始 HTML], "tags": ["td"/"th"]}]。
+
+    以堆疊追蹤 table / tr / td 的巢狀深度，因此：
+      * 巢狀表格的列不會把外層列切斷，兩者都能各自完整取得；
+      * 儲存格保留【原始 HTML】，pageCode2Img()、<span style="color:red"> 等
+        後續要再解析的內容不會在這一步被吃掉；
+      * 原始碼漏掉 </tr> / </td> 時同層自動收尾，不會整份解析崩掉。
+    列依【開始標籤的出現順序】回傳，與畫面上的順序一致。
+    """
+    rows, row_stack, cell_stack = [], [], []
+    table_depth = 0
+    order = 0
+
+    def close_cell(end: int):
+        cell = cell_stack.pop()
+        if row_stack:
+            row_stack[-1]["cells"].append(html_doc[cell["start"]:end])
+            row_stack[-1]["tags"].append(cell["tag"])
+
+    def close_row():
+        row = row_stack.pop()
+        if row["cells"]:
+            rows.append(row)
+
+    for match in _TABLE_TOKEN_RE.finditer(html_doc):
+        closing = match.group(1) == "/"
+        tag = match.group(2).lower()
+
+        if tag == "table":
+            if closing:
+                while cell_stack and cell_stack[-1]["depth"] >= table_depth:
+                    close_cell(match.start())
+                while row_stack and row_stack[-1]["depth"] >= table_depth:
+                    close_row()
+                table_depth = max(0, table_depth - 1)
+            else:
+                table_depth += 1
+        elif tag == "tr":
+            if closing:
+                while cell_stack and cell_stack[-1]["depth"] >= table_depth:
+                    close_cell(match.start())
+                if row_stack:
+                    close_row()
+            else:
+                while row_stack and row_stack[-1]["depth"] >= table_depth:
+                    while cell_stack and cell_stack[-1]["depth"] >= table_depth:
+                        close_cell(match.start())
+                    close_row()
+                order += 1
+                row_stack.append({"cells": [], "tags": [], "depth": table_depth,
+                                  "order": order})
+        else:  # td / th
+            if closing:
+                if cell_stack:
+                    close_cell(match.start())
+            else:
+                while cell_stack and cell_stack[-1]["depth"] >= table_depth:
+                    close_cell(match.start())
+                cell_stack.append({"start": match.end(), "tag": tag,
+                                   "depth": table_depth})
+
+    while cell_stack:
+        close_cell(len(html_doc))
+    while row_stack:
+        close_row()
+
+    rows.sort(key=lambda row: row["order"])
+    return rows
 
 
 # 欄位 -> (搜尋結果表頭文字, 表頭缺失時的預設 td 索引)
@@ -272,8 +373,8 @@ def parse_column_index(html_doc: str):
     並產生警告，避免網站改版後靜默輸出錯位資料。
     """
     header_cells = []
-    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", html_doc, re.DOTALL):
-        cells = re.findall(r"<th[^>]*>(.*?)</th>", row, re.DOTALL)
+    for row in iter_table_rows(html_doc):
+        cells = [html for html, tag in zip(row["cells"], row["tags"]) if tag == "th"]
         if cells:
             header_cells = [strip_tags(c).replace(" ", "") for c in cells]
             break
@@ -367,15 +468,16 @@ def parse_tender_rows(html_doc: str, keyword: str, col_index: dict = None) -> li
     required_len = max(col_index.values()) + 1
     tenders = []
 
-    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", html_doc, re.DOTALL):
+    for table_row in iter_table_rows(html_doc):
+        cells = [html for html, tag in zip(table_row["cells"], table_row["tags"])
+                 if tag == "td"]
+        if len(cells) < required_len:
+            continue
+        row = " ".join(cells)  # pk 連結必定落在某個儲存格內
         pk_match = re.search(r'pk=([^&"\'>\s]+)', row)
         if not pk_match:
             continue
         pk = pk_match.group(1)
-
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
-        if len(cells) < required_len:
-            continue
 
         tender_id, tender_name, notice_type = _split_id_and_name(cells[col_index["id_name"]])
         org_name = strip_tags(cells[col_index["org"]])
@@ -594,19 +696,20 @@ def fetch_actual_award_method(pk: str) -> str:
     return fetch_award_method_status(pk)[0]
 
 
-def apply_award_method(tender: dict, actual_award: str):
-    """以詳細頁的真實決標方式覆蓋推估值，並同步更新衍生欄位。"""
+def apply_award_method(tender: dict, actual_award: str,
+                       source: str = AWARD_SOURCE_OFFICIAL):
+    """以公告上的真實決標方式覆蓋推估值，並同步更新衍生欄位。"""
     desc, is_lowest = determine_award_method(tender.get("招標方式", ""), actual_award)
     tender["決標方式"] = desc
-    tender["決標方式來源"] = AWARD_SOURCE_OFFICIAL
+    tender["決標方式來源"] = source
     tender["是否為最低標"] = "是" if is_lowest else "否"
     is_service = tender.get("是否為勞務類") == "是"
     tender["完全符合目標"] = "符合 (勞務+最低標)" if (is_service and is_lowest) else "其他"
 
 
 def is_award_confirmed(tender: dict) -> bool:
-    """該筆的決標方式是否已由官方詳細頁確認（而非依招標方式推估）。"""
-    return tender.get("決標方式來源") == AWARD_SOURCE_OFFICIAL
+    """該筆的決標方式是否已由公告確認（官網詳細頁或公開資料鏡像，而非依招標方式推估）。"""
+    return tender.get("決標方式來源") in CONFIRMED_SOURCES
 
 
 # ==================== 已確認決標方式的永久快取 ====================
@@ -625,19 +728,26 @@ def load_json_dict(path: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_json_dict(data: dict, path: str):
-    """先寫暫存檔再 os.replace，避免寫到一半被中斷而毀掉既有檔案。"""
+def save_json_dict(data: dict, path: str) -> bool:
+    """
+    先寫暫存檔再 os.replace，避免寫到一半被中斷而毀掉既有檔案。回傳是否寫入成功。
+
+    寫檔失敗必須讓呼叫端知道：決標方式的累積策略成敗全繫於這個寫入，
+    先前這裡靜默吞掉 OSError，磁碟滿了或資料夾唯讀時使用者會以為一切正常。
+    """
     tmp = f"{path}.tmp"
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
         os.replace(tmp, path)
+        return True
     except OSError:
         try:
             os.remove(tmp)
         except OSError:
             pass
+        return False
 
 
 def award_cache_path(output_dir: str) -> str:
@@ -650,39 +760,159 @@ def settings_path(output_dir: str) -> str:
     return os.path.join(output_dir, SETTINGS_FILENAME)
 
 
+def pending_queue_path(output_dir: str) -> str:
+    """待確認佇列檔的完整路徑。"""
+    return os.path.join(output_dir, PENDING_QUEUE_FILENAME)
+
+
 def load_award_cache(path: str) -> dict:
     """讀取已確認決標方式的快取。"""
     return load_json_dict(path)
 
 
-def save_award_cache(cache: dict, path: str):
-    """把快取原子性地寫回磁碟。"""
-    save_json_dict(cache, path)
+def save_award_cache(cache: dict, path: str) -> bool:
+    """把快取原子性地寫回磁碟；回傳是否寫入成功。"""
+    return save_json_dict(cache, path)
 
 
-def remember_award(cache: dict, tender: dict, actual_award: str):
+def save_pending_queue(tenders: list, path: str) -> bool:
+    """
+    把還沒確認決標方式的標案落地，供背景涓流校驗取用。
+
+    只存涓流需要的欄位，不是整份搜尋結果的備份——那是 Excel 報表的職責：
+    pk 用來連官網詳細頁（備援路徑），案號用來寫回快取，
+    公告日期 ＋ 機關 ＋ 名稱是鏡像 API 定位同一案的鑰匙（案號會跨機關重複）。
+    """
+    queue = {}
+    for position, tender in enumerate(tenders):
+        tender_id = tender.get("標案案號")
+        pk = tender.get("pk")
+        if not tender_id or not pk:
+            continue
+        queue[tender_id] = {
+            "pk": pk,
+            "標案名稱": tender.get("標案名稱", ""),
+            "招標機關": tender.get("招標機關", ""),
+            "招標方式": tender.get("招標方式", ""),
+            "公告日期": tender.get("公告日期", ""),
+            # 呼叫端給的順序就是優先順序（公告日期新→舊）。JSON 以案號排序存放，
+            # 不記下來的話取件會變成字母序，先去確認那些早就過了等標期的舊案。
+            "order": position,
+            "queued_at": date.today().isoformat(),
+        }
+    return save_json_dict(queue, path)
+
+
+def load_pending_queue(path: str, cache: dict = None) -> list:
+    """
+    讀回待確認佇列，並剔除同時期已被快取確認過的案號。
+
+    回傳 enrich/trickle 可直接吃的 dict 清單（含 pk 與案號），
+    順序依存檔時記下的優先序——額度稀缺，要先花在還能投標的新案子上。
+    """
+    queue = load_json_dict(path)
+    rows = []
+    for tender_id, entry in queue.items():
+        if not isinstance(entry, dict):
+            continue
+        if cache and cached_award(cache.get(tender_id)) is not None:
+            continue  # 已經確認過，不必再排隊
+        pk = entry.get("pk")
+        if not pk:
+            continue
+        rows.append({
+            "pk": pk,
+            "標案案號": tender_id,
+            "標案名稱": entry.get("標案名稱", ""),
+            "招標機關": entry.get("招標機關", ""),
+            "招標方式": entry.get("招標方式", ""),
+            "採購性質": entry.get("採購性質", ""),
+            "公告日期": entry.get("公告日期", ""),
+            "決標方式來源": AWARD_SOURCE_ESTIMATED,
+            "order": entry.get("order", 0),
+        })
+    rows.sort(key=lambda row: row["order"])
+    return rows
+
+
+def remember_award(cache: dict, tender: dict, actual_award: str,
+                   source: str = AWARD_SOURCE_OFFICIAL):
     """把一筆已確認的決標方式記進快取（就地更新 cache）。"""
     tender_id = tender.get("標案案號")
     if not tender_id or not actual_award:
         return
     cache[tender_id] = {
         "決標方式": actual_award,
+        "決標方式來源": source,
         "pk": tender.get("pk", ""),
         "verified_at": date.today().isoformat(),
     }
 
 
-def apply_award_cache(tenders: list, cache: dict) -> int:
-    """把快取中已確認的決標方式套回標案清單，回傳實際套用筆數。"""
+def _entry_age_days(entry) -> int:
+    """快取條目距今幾天；沒有 verified_at（早期版本寫的）時回傳 0 視為仍新鮮。"""
+    if not isinstance(entry, dict):
+        return 0
+    stamp = entry.get("verified_at")
+    if not stamp:
+        return 0
+    try:
+        verified = date.fromisoformat(str(stamp))
+    except ValueError:
+        return 0
+    return (date.today() - verified).days
+
+
+def cached_award(entry, ttl_days: int = AWARD_CACHE_TTL_DAYS):
+    """
+    取出快取條目中仍在有效期內的決標方式；已過期或無值時回傳 None。
+
+    條目可能是 {"決標方式": ..., "verified_at": ...} 或早期版本的純字串，兩者都要吃。
+    """
+    if not entry:
+        return None
+    actual = entry.get("決標方式") if isinstance(entry, dict) else entry
+    if not actual:
+        return None
+    if ttl_days and ttl_days > 0 and _entry_age_days(entry) > ttl_days:
+        return None
+    return actual
+
+
+def cached_source(entry) -> str:
+    """快取條目的來源標籤。舊版條目沒記來源，一律當成官方詳細頁（當時的唯一來源）。"""
+    if isinstance(entry, dict):
+        source = entry.get("決標方式來源")
+        if source in CONFIRMED_SOURCES:
+            return source
+    return AWARD_SOURCE_OFFICIAL
+
+
+def prune_award_cache(cache: dict, ttl_days: int = AWARD_CACHE_TTL_DAYS) -> int:
+    """就地刪掉已過期的快取條目，回傳刪除筆數（讓檔案不會無限長大）。"""
+    stale = [k for k, v in cache.items() if cached_award(v, ttl_days) is None]
+    for key in stale:
+        del cache[key]
+    return len(stale)
+
+
+def apply_award_cache(tenders: list, cache: dict,
+                      ttl_days: int = AWARD_CACHE_TTL_DAYS) -> int:
+    """
+    把快取中已確認的決標方式套回標案清單，回傳實際套用筆數。
+
+    超過 ttl_days 的條目視同沒確認過：更正公告會改動決標方式，過期的答案
+    比「待確認」更危險——後者至少畫成橘色提醒使用者自己去看。
+    """
     if not cache:
         return 0
     applied = 0
     for tender in tenders:
         entry = cache.get(tender.get("標案案號", ""))
-        actual = entry.get("決標方式") if isinstance(entry, dict) else entry
+        actual = cached_award(entry, ttl_days)
         if not actual:
             continue
-        apply_award_method(tender, actual)
+        apply_award_method(tender, actual, cached_source(entry))
         applied += 1
     return applied
 
@@ -707,93 +937,176 @@ def select_rows_for_enrichment(tenders: list, target_attr: str = "勞務",
     return candidates
 
 
-def enrich_actual_award_methods(tenders: list, max_workers: int = 1,
-                                progress_cb=None, log=None,
+def enrich_actual_award_methods(tenders: list, progress_cb=None, log=None,
                                 cache: dict = None, cache_path: str = None,
-                                should_stop=None) -> dict:
+                                should_stop=None, use_mirror: bool = True) -> dict:
     """
-    連線官方詳細頁校驗真實決標方式。
+    校驗真實決標方式：【先問公開資料鏡像，鏡像查無此案才退回官網詳細頁】。
 
-    站方對詳細頁採額度制（實測約 5 筆就會回「驗證碼檢核」頁，且冷卻為 IP 層級的分鐘級），
-    一次執行本來就不可能校驗完整份清單。這裡的策略是【只拿走免費的那幾筆就收手】：
-    單執行緒、每次請求前隨機間隔，連續 CAPTCHA_STREAK_LIMIT 筆被擋即中止，
-    整段最多只多花十幾秒，不讓每次搜尋為了硬啃清單而卡上幾分鐘。
+    官網詳細頁是 IP 層級的額度制（約 5 筆就回驗證碼檢核頁、冷卻分鐘級），
+    單靠它一次執行本來就補不完清單。鏡像 API 供的是同一批公告資料、沒有這個額度，
+    所以絕大多數標案根本不必碰官網——額度只花在鏡像真的沒有的那幾筆。
 
-    傳入 cache 與 cache_path 時，每成功一筆就立刻落地保存——這是本模組能補完
-    「公開取得 (待確認)」的唯一途徑：每次搜尋免費撿幾筆，跨次執行累積。
+    兩條路徑的失敗語意不同，處理方式也不同：
+      * 鏡像 blocked（429 限流）—— 下一輪就會有，【不】退回官網，免得白燒官網額度。
+      * 鏡像 error（查無此案／缺欄位）—— 重試也一樣，才退回官網詳細頁。
+      * 鏡像連續 MIRROR_FAIL_STREAK 筆失敗 —— 判定此刻不可靠，整輪改走官網。
+
+    官網備援路徑維持原本的保守策略：逐筆循序、請求前隨機間隔，
+    連續 CAPTCHA_STREAK_LIMIT 筆被擋即中止。刻意不並行：站方限的是額度不是頻率，
+    開執行緒只會更快把額度燒完，卻換不到更多資料。
+
+    傳入 cache 與 cache_path 時，每成功一筆就立刻落地保存，確認結果跨次執行累積。
 
     should_stop 為選用的無參數回呼，回傳 True 即提前收手（使用者按下停止）。
 
-    progress_cb(done, total) 為選用回呼；回傳 {"total", "done", "ok", "blocked"}。
+    progress_cb(done, total) 為選用回呼；
+    回傳 {"total", "done", "ok", "blocked", "mirror_ok", "official_ok"}。
     """
     emit = log if callable(log) else (lambda _msg: None)
     cancelled = should_stop if callable(should_stop) else (lambda: False)
-    stats = {"total": len(tenders), "done": 0, "ok": 0, "blocked": False}
+    total = len(tenders)
+    stats = {"total": total, "done": 0, "ok": 0, "blocked": False,
+             "mirror_ok": 0, "official_ok": 0}
     if not tenders:
         return stats
 
-    total = len(tenders)
-    emit(f"[*] 正在連線官方詳細頁校驗決標方式 (共 {total} 筆標案)...")
+    source_desc = "公開資料鏡像（官網詳細頁備援）" if use_mirror else "官網詳細頁"
+    emit(f"[*] 正在校驗決標方式 (共 {total} 筆標案，來源：{source_desc})...")
 
-    counter = {"done": 0, "ok": 0, "streak": 0, "blocked": 0}
-    lock = threading.Lock()
-    stop = threading.Event()
+    done = ok = mirror_ok = official_ok = blocked_count = streak = 0
+    save_failed = False
+    cancelled_early = False
 
-    def _fetch_and_update(tender):
+    # {YYYYMMDD: 當日索引}：同一個公告日期只會打一次 listbydate，
+    # 一次請求就涵蓋當天全部標案，這是鏡像路徑省請求的關鍵。
+    index_cache = {}
+    mirror_live = use_mirror
+    mirror_fail_streak = 0
+
+    for tender in tenders:
         if cancelled():
-            stop.set()
-        if stop.is_set():
-            with lock:
-                counter["done"] += 1
-                done = counter["done"]
-            if progress_cb:
-                progress_cb(done, total)
-            return
+            # 使用者主動喊停不是「被站方擋下」，兩者混為一談會讓 GUI 跳出
+            # 「官網額度已用盡」這種與事實不符的提示。
+            cancelled_early = True
+            break
 
-        time.sleep(random.uniform(*DETAIL_DELAY_RANGE))
-        actual, status = fetch_award_method_status(tender.get("pk", ""))
-        if actual:
-            apply_award_method(tender, actual)
+        actual, status, source = "", "", ""
 
-        with lock:
-            counter["done"] += 1
+        if mirror_live:
+            mirror.polite_delay()
+            actual, status = mirror.fetch_award_method_status(tender, index_cache)
             if actual:
-                counter["ok"] += 1
-                if cache is not None:
-                    remember_award(cache, tender, actual)
-                    if cache_path:
-                        save_award_cache(cache, cache_path)
-            if status == "blocked":
-                counter["blocked"] += 1
-                counter["streak"] += 1
-                if counter["streak"] >= CAPTCHA_STREAK_LIMIT and not stop.is_set():
-                    stop.set()
-                    emit(f"  [!] 本輪額度已用盡（連續 {CAPTCHA_STREAK_LIMIT} 筆被驗證碼防護擋下，"
-                         f"IP 層級冷卻），停止校驗；剩餘 {total - counter['done']} 筆維持"
-                         f"「{AWARD_SOURCE_ESTIMATED}」，已確認的都已寫入快取。")
-            else:
-                counter["streak"] = 0
-            done = counter["done"]
+                source = AWARD_SOURCE_MIRROR
+                mirror_ok += 1
+                mirror_fail_streak = 0
+            elif status == "error":
+                # 只有 error（查無此案）才算「鏡像幫不上忙」。被限流不算：
+                # 因為限流而整輪改走官網，等於把暫時性的問題換成永久性的額度損失。
+                mirror_fail_streak += 1
+                if mirror_fail_streak >= mirror.MIRROR_FAIL_STREAK:
+                    mirror_live = False
+                    emit(f"  [!] 公開資料鏡像連續 {mirror.MIRROR_FAIL_STREAK} 筆查不到，"
+                         f"本輪改用官網詳細頁（額度有限）。")
+
+        # 鏡像被限流是暫時的，下一輪就有；此時退回官網只是白燒那 5 筆額度
+        fall_back = not actual and status != "blocked"
+        if fall_back:
+            time.sleep(random.uniform(*DETAIL_DELAY_RANGE))
+            actual, status = fetch_award_method_status(tender.get("pk", ""))
+            if actual:
+                source = AWARD_SOURCE_OFFICIAL
+                official_ok += 1
+
+        done += 1
+
+        if actual:
+            apply_award_method(tender, actual, source)
+            ok += 1
+            if cache is not None:
+                remember_award(cache, tender, actual, source)
+                if cache_path and not save_award_cache(cache, cache_path) and not save_failed:
+                    # 整個累積策略成敗就繫於這個寫入，失敗必須講出來
+                    save_failed = True
+                    emit(f"  [!] 無法寫入決標方式快取（{cache_path}）——"
+                         f"本輪確認的結果不會保留到下次執行，請檢查該資料夾是否可寫入。")
+
+        if status == "blocked":
+            blocked_count += 1
+            # 官網的額度是連續被擋才算用盡；鏡像限流不該觸發官網那條中止規則
+            streak = streak + 1 if fall_back else streak
+        elif fall_back:
+            streak = 0
 
         if progress_cb:
             progress_cb(done, total)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        list(executor.map(_fetch_and_update, tenders))
+        if streak >= CAPTCHA_STREAK_LIMIT:
+            stats["blocked"] = True
+            emit(f"  [!] 官網詳細頁額度已用盡（連續 {CAPTCHA_STREAK_LIMIT} 筆被驗證碼防護擋下，"
+                 f"IP 層級冷卻），停止校驗；剩餘 {total - done} 筆維持"
+                 f"「{AWARD_SOURCE_ESTIMATED}」，已確認的都已寫入快取。")
+            break
 
-    stats.update(done=counter["done"], ok=counter["ok"], blocked=stop.is_set())
+    stats.update(done=done, ok=ok, mirror_ok=mirror_ok, official_ok=official_ok)
 
-    if not stop.is_set():
-        # 被驗證碼擋下與「詳細頁沒有該欄位」是兩回事：前者稍後重試就能拿到，
+    if ok and use_mirror:
+        emit(f"  [+] 本輪確認 {ok} 筆（鏡像 {mirror_ok} 筆、官網詳細頁 {official_ok} 筆）。")
+
+    if not stats["blocked"] and not cancelled_early:
+        # 被擋下與「公告本來就沒有該欄位」是兩回事：前者稍後重試就能拿到，
         # 後者重試幾次都一樣。混為一談會讓使用者不知道到底該不該再試一次。
-        blocked = counter["blocked"]
-        missing = total - counter["ok"] - blocked
-        if blocked:
-            emit(f"  [!] 有 {blocked} 筆被網站驗證碼防護擋下（詳細頁每輪約 {CAPTCHA_STREAK_LIMIT} 筆額度，"
-                 f"冷卻為 IP 層級），維持「{AWARD_SOURCE_ESTIMATED}」，稍後重試即可。")
-        if missing:
-            emit(f"  [!] 有 {missing} 筆標案的詳細頁沒有決標方式欄位，維持依招標方式的推估值。")
+        missing = done - ok - blocked_count
+        if blocked_count:
+            emit(f"  [!] 有 {blocked_count} 筆被限流擋下，維持「{AWARD_SOURCE_ESTIMATED}」，"
+                 f"稍後重試即可。")
+        if missing > 0:
+            emit(f"  [!] 有 {missing} 筆標案的公告沒有決標方式欄位，維持依招標方式的推估值。")
     return stats
+
+
+# ==================== 背景涓流校驗 ====================
+#
+# 主來源換成沒有額度限制的公開資料鏡像後，每輪能撿的量不再被卡在 5 筆。
+# 以全掃勞務類為例：待確認約 1,098 筆、每天新增約 157 筆；
+# 每 15 分鐘一輪、每輪 40 筆，一天 96 輪 ≈ 3,800 筆，待確認清單會實際收斂。
+# 間隔維持 15 分鐘：鏡像是志工維運的免費服務，沒有理由把它當成自己的資料庫來刷。
+
+DEFAULT_TRICKLE_INTERVAL_SECONDS = 900
+DEFAULT_TRICKLE_BATCH = 40
+
+
+def trickle_verify(cache_path: str, queue_path: str, batch: int = DEFAULT_TRICKLE_BATCH,
+                   log=None, should_stop=None, use_mirror: bool = True) -> dict:
+    """
+    跑【一輪】背景校驗：從待確認佇列取 batch 筆查公告，成果寫回快取與佇列。
+
+    回傳 {"picked", "ok", "blocked", "remaining"}。呼叫端只要照固定間隔重複呼叫，
+    確認結果就會自己累積——不需要使用者做任何事，也不必重跑全面掃描。
+    """
+    emit = log if callable(log) else (lambda _msg: None)
+    cache = load_award_cache(cache_path)
+    pending = load_pending_queue(queue_path, cache)
+    result = {"picked": 0, "ok": 0, "blocked": False, "remaining": len(pending)}
+    if not pending:
+        return result
+
+    batch_rows = pending[:max(1, batch)]
+    result["picked"] = len(batch_rows)
+    stats = enrich_actual_award_methods(batch_rows, log=log, cache=cache,
+                                        cache_path=cache_path, should_stop=should_stop,
+                                        use_mirror=use_mirror)
+    result["ok"] = stats["ok"]
+    result["blocked"] = stats["blocked"]
+
+    # 確認過的從佇列移除；沒確認到的留著等下一輪，佇列才不會愈積愈長
+    remaining = [row for row in pending if cached_award(cache.get(row["標案案號"])) is None]
+    result["remaining"] = len(remaining)
+    save_pending_queue(remaining, queue_path)
+
+    if stats["ok"]:
+        emit(f"[+] 本輪確認 {stats['ok']} 筆決標方式，待確認尚餘 {len(remaining)} 筆。")
+    return result
 
 
 # ==================== 去重與篩選 ====================
