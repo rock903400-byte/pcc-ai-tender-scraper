@@ -86,7 +86,6 @@ DISPLAY_COLUMNS = [
     "詳細連結",
 ]
 
-DISPLAY_COLUMNS_VISIBLE = DISPLAY_COLUMNS
 
 MAX_LOG_LINES = 1000
 LOG_KEEP = 500
@@ -165,13 +164,6 @@ def init_session_state():
         "hide_pending": False,
         "filter_matched": "",
         "filter_all": "",
-        # 進階過濾狀態
-        "budget_range_matched": (0, 2000),
-        "urgency_matched": "全部",
-        "award_status_matched": "全部",
-        "budget_range_all": (0, 2000),
-        "urgency_all": "全部",
-        "award_status_all": "全部",
         "_settings_restored": False,
         # 非阻塞搜尋相關
         "search_queue": None,
@@ -186,7 +178,6 @@ def init_session_state():
         "trickle_thread": None,
         "trickle_stop_event": None,
         "is_trickling": False,
-        "trickle_progress": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
