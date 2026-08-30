@@ -240,12 +240,6 @@ def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int
         st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄")
 
 
-def render_watchlist_actions(rows: list, key_prefix: str) -> None:
-    """(已棄用，C3 改為表格直接選取) 保留以免舊呼叫崩潰，實際不再使用。"""
-    # C3 後收藏改為表格 on_select，此函式僅為相容性保留，不再渲染
-    return
-
-
 # ==================== 檔案路徑與狀態 ====================
 
 def award_cache_path() -> str:
@@ -1260,10 +1254,6 @@ with tab_matched:
             st.warning("無符合篩選條件的精選標案。請調整搜尋關鍵字或放寬進階篩選條件。")
         else:
             render_tender_table(filtered, "matched", f"顯示 {len(filtered)} / {len(base_rows)} 筆（原始符合條件 {len(_qualified)} 筆） · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符", selectable=True)
-
-        # C3 後不再使用下拉，改為表格選取（render_tender_table 內已含按鈕）
-        # 保留空呼叫以相容
-        # render_watchlist_actions(filtered, "matched")
 
         st.divider()
         st.markdown("**匯出**")
