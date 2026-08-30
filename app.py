@@ -938,11 +938,13 @@ def render_analytics_dashboard(tenders: list, qualified: list, keyword_hits: lis
     # 第三列：截標急迫度統計
     st.subheader("⏳ 截標急迫度時間軸分析")
     urgency_df = urgency_bins_frame(tenders)
+    # 與 ui_logic.py:350 urgency_bins 鍵順序一致，勿用未定義的 urgency_bins 變數（曾致 NameError）
+    urgency_order = ["🔥 3天內即將截標", "⏳ 4~7天內截標", "📅 8~14天內截標", "🗓️ 14天以上", "⌛ 已截標 / 截止日期未定"]
     chart_urgency = alt.Chart(urgency_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
-        x=alt.X("急迫度分類:N", sort=list(urgency_bins.keys()), title="急迫度分類"),
+        x=alt.X("急迫度分類:N", sort=urgency_order, title="急迫度分類"),
         y=alt.Y("標案數量:Q", title="標案數量"),
         color=alt.Color("急迫度分類:N", scale=alt.Scale(
-            domain=list(urgency_bins.keys()),
+            domain=urgency_order,
             range=["#EF4444", "#F59E0B", "#3B82F6", "#10B981", "#64748B"]
         ), legend=None),
         tooltip=["急迫度分類", "標案數量"],
