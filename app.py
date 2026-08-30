@@ -741,16 +741,7 @@ def run_trickle_thread(q: queue.Queue, stop_event: threading.Event):
 def render_analytics_dashboard(tenders: list, qualified: list, keyword_hits: list):
     """繪製大盤統計分析看板。"""
     if not tenders:
-        st.markdown(
-            """
-            <div class="empty-illustration">
-                <div style="font-size: 42px;">📊</div>
-                <div style="font-size: 16px; font-weight: 600; margin: 8px 0; color: #E2E8F0;">尚未載入分析數據</div>
-                <div style="font-size: 13px; color: #94A3B8;">請先在左側設定條件並完成一次搜尋，即可即時查看標案市場大盤圖表</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_empty_state("📊", "尚未載入分析數據", "請先在左側設定條件並完成一次搜尋，即可即時查看標案市場大盤圖表")
         return
 
     # 計算統計指標
@@ -874,39 +865,54 @@ if not st.session_state._settings_restored:
         st.session_state.active_award_target = st.session_state.award
         st.session_state.active_filter_label = describe_filter(st.session_state.attr, st.session_state.award)
 
+def render_empty_state(icon: str, title: str, body_html: str) -> None:
+    """渲染空狀態插圖，使用主題變數確保深淺主題皆可讀。"""
+    st.markdown(
+        f"""
+        <div class="empty-illustration">
+            <div style="font-size: 42px;">{icon}</div>
+            <div style="font-size: 16px; font-weight: 600; margin: 8px 0;">{title}</div>
+            <div style="font-size: 13px; line-height: 1.6;">{body_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,  # nosec: static HTML only, no tender data interpolated
+    )
+
+
 # ---------- Header & CSS ----------
 st.markdown(
     """
     <style>
     .block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
-    /* 卡片化 metric 與漸層效果 */
+    /* 卡片化 metric，使用主題變數，淺色/深色皆可讀 */
     [data-testid="stMetric"] {
-        background: linear-gradient(145deg, #1E293B, #0F172A);
-        border: 1px solid #334155;
+        background: var(--secondary-background-color);
+        border: 1px solid color-mix(in srgb, var(--text-color) 12%, transparent);
         border-radius: 12px;
         padding: 14px 16px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+        box-shadow: 0 2px 8px color-mix(in srgb, var(--text-color) 8%, transparent);
         transition: transform 0.2s ease, border-color 0.2s ease;
     }
     [data-testid="stMetric"]:hover {
-        border-color: #38BDF8;
+        border-color: var(--primary-color);
         transform: translateY(-2px);
     }
-    [data-testid="stMetricLabel"] {font-size: 0.85rem; color: #94A3B8; font-weight: 500;}
-    [data-testid="stMetricValue"] {font-weight: 700; color: #F8FAFC;}
-    [data-testid="stMetricDelta"] {font-size: 0.8rem;}
-    /* 空狀態 - 深底精緻風格 */
+    [data-testid="stMetricLabel"] {font-size: 0.85rem; color: color-mix(in srgb, var(--text-color) 65%, transparent); font-weight: 500;}
+    [data-testid="stMetricValue"] {font-weight: 700; color: var(--text-color);}
+    [data-testid="stMetricDelta"] {font-size: 0.8rem; color: var(--text-color);}
+    /* 空狀態 - 使用主題變數，邊框與文字在兩主題下皆清晰 */
     .empty-illustration {
         text-align: center;
         padding: 40px 24px;
-        background: #1E293B;
-        border: 1px dashed #475569;
+        background: var(--secondary-background-color);
+        border: 1px dashed color-mix(in srgb, var(--text-color) 20%, transparent);
         border-radius: 14px;
         margin: 18px 0;
+        color: var(--text-color);
     }
-    .empty-illustration div {color: #CBD5E1 !important;}
-    /* 表格與按鈕微調 */
-    [data-testid="stDataFrame"] {border-radius: 10px; overflow: hidden; border: 1px solid #334155;}
+    .empty-illustration div {color: var(--text-color) !important;}
+    /* 表格與按鈕微調，使用主題變數 */
+    [data-testid="stDataFrame"] {border-radius: 10px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--text-color) 12%, transparent);}
     .stButton>button {border-radius: 8px; font-weight: 500;}
     .badge-pill {
         display: inline-block;
@@ -916,7 +922,7 @@ st.markdown(
         font-weight: 600;
         margin-right: 6px;
     }
-    .badge-blue {background: #0284C7; color: #FFFFFF;}
+    .badge-blue {background: var(--primary-color); color: var(--background-color);}
     .badge-amber {background: #D97706; color: #FFFFFF;}
     </style>
     """,
@@ -1235,20 +1241,7 @@ tab_matched, tab_all, tab_analytics, tab_watchlist, tab_logs = st.tabs([
 # ==================== Tab 1: 🏆 精選 ====================
 with tab_matched:
     if not st.session_state.tenders_all:
-        st.markdown(
-            """
-            <div class="empty-illustration">
-                <div style="font-size: 42px;">🔍</div>
-                <div style="font-size: 16px; font-weight: 600; margin: 8px 0; color: #E2E8F0;">尚未搜尋</div>
-                <div style="font-size: 13px; color: #94A3B8; line-height: 1.6;">
-                    在左側設定 <b style="color:#E2E8F0;">關鍵字、日期模式、採購性質、決標方式</b> 後<br>
-                    按 <b style="color:#5B8DEF;">🚀 開始搜尋標案</b> 即可擷取最新公告<br>
-                    <span style="color:#7DD3FC;">💡 首次建議：維持預設「勞務 + 最低標 + 等標期內」直接搜尋，約 1-3 分鐘完成</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_empty_state("🔍", "尚未搜尋", '在左側設定 <b>關鍵字、日期模式、採購性質、決標方式</b> 後<br>按 <b>🚀 開始搜尋標案</b> 即可擷取最新公告<br>💡 首次建議：維持預設「勞務 + 最低標 + 等標期內」直接搜尋，約 1-3 分鐘完成')
     else:
         base_rows = _qualified if st.session_state.include_misses else _keyword_hits
 
@@ -1307,15 +1300,7 @@ with tab_matched:
 # ==================== Tab 2: 📋 所有標案 ====================
 with tab_all:
     if not st.session_state.tenders_all:
-        st.markdown(
-            """
-            <div class="empty-illustration">
-                <div style="font-size: 42px;">📋</div>
-                <div style="font-size: 14px; color: #94A3B8; margin-top: 6px;">尚無資料，請先在精選分頁完成搜尋</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_empty_state("📋", "尚無資料", "請先在精選分頁完成搜尋")
     else:
         filt_all = render_filter_panel("all", st.session_state.tenders_all)
         filtered_all = build_advanced_display_rows(
@@ -1426,19 +1411,7 @@ with tab_watchlist:
 
     watchlist_items = _resolve_watchlist_rows()
     if not watchlist_items:
-        st.markdown(
-            """
-            <div class="empty-illustration">
-                <div style="font-size: 42px;">⭐</div>
-                <div style="font-size: 16px; font-weight: 600; margin: 8px 0; color: #E2E8F0;">目前追蹤清單尚無標案</div>
-                <div style="font-size: 13px; color: #94A3B8;">
-                    在「🏆 精選」或「📋 所有標案」展開「標案收藏與追蹤操作」即可將關注的標案加入此清單。<br>
-                    追蹤資料會自動保存於 <code>output/watchlist.json</code>，下次開啟程式自動保留。
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_empty_state("⭐", "目前追蹤清單尚無標案", '在「🏆 精選」或「📋 所有標案」勾選表格列並按「加入追蹤」即可將關注的標案加入此清單。<br>追蹤資料會自動保存於 <code>output/watchlist.json</code>，下次開啟程式自動保留。')
     else:
         # 統計已截標（用 get_days_remaining，與篩選器一致）
         expired_count = sum(1 for t in watchlist_items if (get_days_remaining(t.get("截止投標", "")) is not None and get_days_remaining(t.get("截止投標", "")) < 0))
