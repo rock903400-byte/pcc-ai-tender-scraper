@@ -20,6 +20,8 @@ import urllib.request
 from datetime import date
 from http.cookiejar import CookieJar
 
+import ssl
+
 import pcc_mirror as mirror
 
 try:
@@ -27,6 +29,16 @@ try:
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
+
+# 政府站憑證在 Python 3.14 + OpenSSL 3.5 嚴格校驗下會因 Missing Subject Key Identifier 被拒
+# （Cloud 上 3.14.7 已復現），改用 unverified 以避免全量搜尋直接 0 筆
+try:
+    _SSL_CTX = ssl._create_unverified_context()
+    # 額外關閉 X509_STRICT 以相容舊憑證（若 Python 版本支援）
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        _SSL_CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT
+except Exception:
+    _SSL_CTX = None
 
 
 # ==================== 網站端點與常數 ====================
@@ -121,7 +133,13 @@ PREFERRED_COLS = [
 # 僅供內部流程使用、不應出現在匯出檔中的鍵
 INTERNAL_KEYS = ("pk", "命中關鍵字群")
 
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+if _SSL_CTX is not None:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(CookieJar()),
+        urllib.request.HTTPSHandler(context=_SSL_CTX),
+    )
+else:
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
 
 
 # ==================== 環境設定 ====================

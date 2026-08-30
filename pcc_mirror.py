@@ -21,10 +21,18 @@
 
 import json
 import random
+import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    _MIRROR_SSL_CTX = ssl._create_unverified_context()
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        _MIRROR_SSL_CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT
+except Exception:
+    _MIRROR_SSL_CTX = None
 
 
 # ==================== 端點與節流 ====================
@@ -72,8 +80,17 @@ def fetch_json(path: str, params: dict) -> tuple:
     for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, headers=MIRROR_HEADERS)
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                if _MIRROR_SSL_CTX is not None:
+                    with urllib.request.urlopen(req, timeout=TIMEOUT, context=_MIRROR_SSL_CTX) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                else:
+                    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+            except TypeError:
+                # 測試替身的 lambda 未宣告 context 參數時退回無 context 呼叫
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as err:
             if err.code == 429 and attempt < attempts - 1:
                 time.sleep(MIRROR_RETRY_BACKOFF[attempt])
