@@ -102,7 +102,7 @@ pcc-ai-tender-scraper/
 ### 方式 A：透過 Streamlit 啟動 Web 介面（推薦）
 
 ```bash
-git clone https://github.com/<your-account>/pcc-ai-tender-scraper.git
+git clone https://github.com/rock903400-byte/pcc-ai-tender-scraper.git
 cd pcc-ai-tender-scraper
 pip install -r requirements.txt
 streamlit run app.py
