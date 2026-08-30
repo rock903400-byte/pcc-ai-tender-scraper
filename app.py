@@ -136,8 +136,7 @@ def render_filter_panel(key_prefix: str, rows: list = None) -> dict:
     if rows:
         max_wan = max([core.parse_amount(t.get("預算金額", "")) for t in rows] + [0]) / 10000.0
         slider_max = int(math.ceil(max_wan / 100.0) * 100) or 2000
-        if slider_max < 2000:
-            pass
+        # 無資料或最大值≤2000萬時保底 2000，避免小資料集滑桿過窄；>2000萬則依實際放大
         slider_max = max(slider_max, 2000) if max_wan <= 2000 else slider_max
         # 機關選項：依本次結果 Top 30
         cnt = Counter(t.get("招標機關", "未知機關") for t in rows if t.get("招標機關"))
@@ -1585,7 +1584,7 @@ with tab_watchlist:
         snapshot_count = sum(1 for t in watchlist_sorted if t.get("_watchlist_source") == "快照")
         if snapshot_count > 0:
             caption_wl += f" · {snapshot_count} 筆為快照（查無最新資料）"
-        # 大追蹤清單分頁（>50 筆時）
+        # 大追蹤清單分頁（>50 筆時；主表用 paginate_rows 預設 100，追蹤表較矮 cap=500 故用 50 以維持 2 頁內可視性）
         WL_LIMIT = 50
         if len(watchlist_sorted) > WL_LIMIT:
             page_wl = st.session_state.get("page_watchlist", 1)
