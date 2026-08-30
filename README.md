@@ -55,6 +55,13 @@
 - ⚙️ **記住上次的搜尋條件**：關鍵字、日期模式、查詢天數、採購性質、決標方式與各開關
   會存進 `output/ui_settings.json`，下次開啟自動還原。
 
+### ⚠️ 使用限制
+
+> **本應用設計為單機單人使用，若要多人共用需自行改造為 per-user 的資料隔離。**
+
+- **全域共用目錄**：`OUTPUT_DIR`（預設 `output/`）為行程層級單一目錄，`watchlist.json` / `ui_settings.json` / `award_cache.json` 皆為全域共用——兩人同時開啟會互相覆蓋追蹤清單、搜尋條件與快取。
+- **節流可繞過**：`RATE_LIMIT_SECONDS`（60 秒）的節流時間戳僅存於 `st.session_state`（`app.py:183`），開新分頁或重啟行程即可繞過。**60 秒節流是為了禮貌對待政府站點，請勿刻意繞過。**
+- **結果僅在記憶體**：搜尋結果只存於 `st.session_state.tenders_all` 等記憶體狀態，重新整理頁面即遺失；僅搜尋條件會從 `output/ui_settings.json` 還原，快取與待確認佇列則持久化於 `output/`。
 
 ---
 
