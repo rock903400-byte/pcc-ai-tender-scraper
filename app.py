@@ -223,7 +223,7 @@ def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int
                         t = rows[i]
                         key_id = tender_key(t)
                         if key_id and key_id not in wl:
-                            wl[key_id] = t
+                            wl[key_id] = {"added_at": datetime.now().isoformat(), "snapshot": t}
                             added_count += 1
                 st.session_state.watchlist = wl
                 save_watchlist(wl)
@@ -265,12 +265,33 @@ def watchlist_path() -> str:
 
 
 def load_watchlist() -> dict:
-    """載入追蹤清單，回傳以 pk 或 標案案號 為 key 的 dict。"""
+    """載入追蹤清單，回傳以 pk 或 標案案號 為 key 的 dict，自動相容舊格式。"""
     try:
         if os.path.exists(watchlist_path()):
             with open(watchlist_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data if isinstance(data, dict) else {}
+                if not isinstance(data, dict):
+                    return {}
+                # 偵測是否為舊格式（value 直接是 tender dict 而非含 snapshot）
+                upgraded = {}
+                need_upgrade = False
+                for k, v in data.items():
+                    if isinstance(v, dict) and "snapshot" in v and "added_at" in v:
+                        upgraded[k] = v
+                    elif isinstance(v, dict):
+                        # 舊格式：value 即 tender 本體
+                        upgraded[k] = {"added_at": datetime.now().isoformat(), "snapshot": v}
+                        need_upgrade = True
+                    else:
+                        upgraded[k] = v
+                # 若有舊格式，自動寫回新格式（不讓舊資料消失）
+                if need_upgrade:
+                    try:
+                        with open(watchlist_path(), "w", encoding="utf-8") as wf:
+                            json.dump(upgraded, wf, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                return upgraded
     except Exception:
         pass
     return {}
@@ -1335,7 +1356,75 @@ with tab_analytics:
 
 # ==================== Tab 4: ⭐ 追蹤清單 ====================
 with tab_watchlist:
-    watchlist_items = list(st.session_state.watchlist.values())
+    # D1：watchlist 改存 {pk: {added_at, snapshot}}，渲染時回填最新狀態
+    def _resolve_watchlist_rows():
+        resolved = []
+        # 快取 award_cache 用於回填
+        try:
+            cache = core.load_award_cache(award_cache_path())
+        except Exception:
+            cache = {}
+        for pk, entry in st.session_state.watchlist.items():
+            snapshot = entry.get("snapshot", entry) if isinstance(entry, dict) and "snapshot" in entry else entry
+            # 1. 嘗試本次搜尋的最新結果
+            latest = None
+            try:
+                latest = st.session_state.tenders_by_pk.get(pk)
+            except Exception:
+                latest = None
+            if latest is not None:
+                # 若有最新結果，直接使用，並嘗試套用 award_cache 的最新決標方式
+                # 使用 core.apply_award_cache 的邏輯：若 cache 有該案號，覆蓋決標方式
+                # 為避免改動原始 latest，這裡複製一份
+                tender = dict(latest)
+                # 嘗試從 cache 回填（若 latest 本身已是最新，apply 會是 no-op）
+                try:
+                    # 建立單筆清單套用 cache
+                    tmp = [dict(tender)]
+                    core.apply_award_cache(tmp, cache)
+                    tender = tmp[0]
+                except Exception:
+                    pass
+                tender["_watchlist_source"] = "最新搜尋"
+                resolved.append(tender)
+                continue
+            # 2. 嘗試從 award_cache 回填（即使不在本次搜尋結果中）
+            if snapshot and pk in cache:
+                # cache 格式為 {案號: {決標方式, 來源, ...}}，需套用到 snapshot
+                try:
+                    tmp = [dict(snapshot)]
+                    core.apply_award_cache(tmp, cache)
+                    tender = tmp[0]
+                    tender["_watchlist_source"] = "快取回填"
+                    resolved.append(tender)
+                    continue
+                except Exception:
+                    pass
+                # 若 apply 失敗，仍嘗試直接取 cache 的決標方式
+                try:
+                    cached_entry = cache.get(pk) or cache.get(snapshot.get("標案案號", ""))
+                    if cached_entry and isinstance(cached_entry, dict):
+                        tender = dict(snapshot)
+                        if "決標方式" in cached_entry:
+                            tender["決標方式"] = cached_entry["決標方式"]
+                        if "決標方式來源" in cached_entry:
+                            tender["決標方式來源"] = cached_entry["決標方式來源"]
+                        tender["_watchlist_source"] = "快取回填"
+                        resolved.append(tender)
+                        continue
+                except Exception:
+                    pass
+            # 3. 都查不到，退回 snapshot
+            if isinstance(snapshot, dict):
+                tender = dict(snapshot)
+                tender["_watchlist_source"] = "快照"
+                resolved.append(tender)
+            else:
+                # 異常格式，仍嘗試加入
+                resolved.append(snapshot if isinstance(snapshot, dict) else {})
+        return resolved
+
+    watchlist_items = _resolve_watchlist_rows()
     if not watchlist_items:
         st.markdown(
             """
@@ -1351,7 +1440,16 @@ with tab_watchlist:
             unsafe_allow_html=True,
         )
     else:
-        render_tender_table(watchlist_items, "watchlist", f"📌 共收藏 {len(watchlist_items)} 筆標案 · 資料永久保存於 `output/watchlist.json`", max_rows=15, cap=500)
+        # 統計已截標（用 get_days_remaining，與篩選器一致）
+        expired_count = sum(1 for t in watchlist_items if (get_days_remaining(t.get("截止投標", "")) is not None and get_days_remaining(t.get("截止投標", "")) < 0))
+        caption_wl = f"📌 共收藏 {len(watchlist_items)} 筆標案 · 資料永久保存於 `output/watchlist.json`"
+        if expired_count > 0:
+            caption_wl += f" · 其中 {expired_count} 筆已截標"
+        # 若有快照來源，提醒使用者部分為快照
+        snapshot_count = sum(1 for t in watchlist_items if t.get("_watchlist_source") == "快照")
+        if snapshot_count > 0:
+            caption_wl += f" · {snapshot_count} 筆為快照（查無最新資料）"
+        render_tender_table(watchlist_items, "watchlist", caption_wl, max_rows=15, cap=500)
 
         col_wl_act1, col_wl_act2, col_wl_act3 = st.columns([2, 1, 1])
         with col_wl_act1:
