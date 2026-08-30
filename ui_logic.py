@@ -28,6 +28,7 @@ DISPLAY_COLUMNS = [
     "招標方式",
     "決標方式來源",
     "截止投標",
+    "剩餘天數",
     "命中關鍵字",
     "詳細連結",
 ]
@@ -186,6 +187,22 @@ def build_advanced_display_rows(
     return rows
 
 
+def format_remaining_days(deadline_str: str) -> str:
+    """依剩餘天數回傳對應 emoji 文字，與篩選器門檻一致。"""
+    days = get_days_remaining(deadline_str)
+    if days is None:
+        return "—"
+    if days < 0:
+        return "已截標"
+    if days <= 3:
+        return f"🔥 {days} 天"
+    if days <= 7:
+        return f"⏳ {days} 天"
+    if days <= 14:
+        return f"📅 {days} 天"
+    return f"🗓️ {days} 天"
+
+
 def tenders_to_dataframe(tenders: list, active_award_target: str = "最低標") -> pd.DataFrame:
     if not tenders:
         return pd.DataFrame(columns=DISPLAY_COLUMNS)
@@ -202,6 +219,7 @@ def tenders_to_dataframe(tenders: list, active_award_target: str = "最低標") 
         budget_text = t.get("預算金額", "")
         budget_val = core.parse_amount(budget_text)
         budget_num = int(budget_val) if budget_val != -1.0 else 0
+        remaining = format_remaining_days(t.get("截止投標", ""))
         data.append({
             "#": idx,
             "公告日期": t.get("公告日期", ""),
@@ -212,6 +230,7 @@ def tenders_to_dataframe(tenders: list, active_award_target: str = "最低標") 
             "招標方式": t.get("招標方式", ""),
             "決標方式來源": source,
             "截止投標": t.get("截止投標", ""),
+            "剩餘天數": remaining,
             "命中關鍵字": t.get("命中關鍵字", "") or "—",
             "詳細連結": t.get("詳細連結", ""),
             "標案案號": t.get("標案案號", ""),

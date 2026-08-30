@@ -565,6 +565,63 @@ class TestUrgencyBinsFrame:
         assert int(df.loc[df["急迫度分類"] == "⏳ 4~7天內截標", "標案數量"].iloc[0]) == 1
 
 
+class TestRemainingDays:
+    """剩餘天數欄位（C2）六個分支與 emoji 門檻"""
+
+    def test_截止日為空回破折號(self):
+        assert ui_logic.format_remaining_days("") == "—"
+        assert ui_logic.format_remaining_days(None) == "—"
+        assert ui_logic.format_remaining_days("待補") == "—"
+
+    def test_已截標回已截標(self):
+        past = (date.today() - timedelta(days=1)).strftime("%Y/%m/%d")
+        assert ui_logic.format_remaining_days(past) == "已截標"
+        assert ui_logic.format_remaining_days((date.today() - timedelta(days=10)).strftime("%Y/%m/%d")) == "已截標"
+
+    def test_3天內為火焰(self):
+        for d in [0, 1, 2, 3]:
+            ds = (date.today() + timedelta(days=d)).strftime("%Y/%m/%d")
+            assert ui_logic.format_remaining_days(ds) == f"🔥 {d} 天"
+
+    def test_4至7天為沙漏(self):
+        for d in [4, 5, 6, 7]:
+            ds = (date.today() + timedelta(days=d)).strftime("%Y/%m/%d")
+            assert ui_logic.format_remaining_days(ds) == f"⏳ {d} 天"
+
+    def test_8至14天為月曆(self):
+        for d in [8, 10, 14]:
+            ds = (date.today() + timedelta(days=d)).strftime("%Y/%m/%d")
+            assert ui_logic.format_remaining_days(ds) == f"📅 {d} 天"
+
+    def test_大於14天為日曆(self):
+        for d in [15, 20, 30]:
+            ds = (date.today() + timedelta(days=d)).strftime("%Y/%m/%d")
+            assert ui_logic.format_remaining_days(ds) == f"🗓️ {d} 天"
+
+    def test_門檻與篩選器一致(self):
+        # 篩選器選 🔥 3天內 時，表格內應只剩 🔥
+        t_fire = _make_tender(截止投標=(date.today() + timedelta(days=2)).strftime("%Y/%m/%d"))
+        t_late = _make_tender(截止投標=(date.today() + timedelta(days=10)).strftime("%Y/%m/%d"))
+        filtered = ui_logic.build_advanced_display_rows([t_fire, t_late], urgency="🔥 3天內即將截標 (≤3天)")
+        df = ui_logic.tenders_to_dataframe(filtered)
+        assert len(df) == 1
+        assert df.iloc[0]["剩餘天數"].startswith("🔥")
+
+    def test_tenders_to_dataframe剩餘天數欄存在且緊接截止投標後(self):
+        df = ui_logic.tenders_to_dataframe([_make_tender()])
+        assert "剩餘天數" in df.columns
+        # 緊接在 截止投標 之後
+        cols = list(df.columns)
+        assert cols.index("剩餘天數") == cols.index("截止投標") + 1
+
+    def test_剩餘天數排序提示(self):
+        # 驗證 app.py 的 TENDER_COLUMN_CONFIG 對剩餘天數有 help 提示
+        import pathlib as pl
+        app_text = pl.Path("app.py").read_text(encoding="utf-8")
+        assert "剩餘天數" in app_text
+        assert "排序請用" in app_text
+
+
 class TestUiLogicNoStreamlit:
     """確保 ui_logic 沒有依賴前端框架"""
 

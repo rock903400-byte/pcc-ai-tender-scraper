@@ -98,6 +98,7 @@ DISPLAY_COLUMNS = [
     "招標方式",
     "決標方式來源",
     "截止投標",
+    "剩餘天數",
     "命中關鍵字",
     "詳細連結",
 ]
@@ -111,7 +112,7 @@ KEYWORDS_MAX_CHARS = 500
 KEYWORDS_MAX_WORDS = 100
 KEYWORDS_MAX_WORD_LEN = 30
 
-# 單一定義的欄位設定，三個分頁共用（C1 重構）
+# 單一定義的欄位設定，三個分頁共用（C1 重構，C2 新增剩餘天數）
 TENDER_COLUMN_CONFIG = {
     "#": st.column_config.NumberColumn("#", width="small"),
     "公告日期": st.column_config.TextColumn("公告日期", width="small"),
@@ -122,6 +123,7 @@ TENDER_COLUMN_CONFIG = {
     "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
     "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
     "截止投標": st.column_config.TextColumn("截止投標", width="small"),
+    "剩餘天數": st.column_config.TextColumn("剩餘天數", width="small", help="🔥≤3天 ⏳4-7天 📅8-14天 🗓️>14天 已截標/— 為特殊狀態；排序請用「截止投標」欄"),
     "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
     "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small", help="點擊開啟官方公告頁面"),
 }
@@ -174,7 +176,8 @@ def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int
         height=table_height(len(display_df), max_rows, cap),
         column_config=TENDER_COLUMN_CONFIG,
     )
-    st.caption(caption)
+    # 剩餘天數為文字（emoji）排序不準，提示使用者用截止投標欄排序（C2 選 caption 方案）
+    st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄")
 
 
 def render_watchlist_actions(rows: list, key_prefix: str) -> None:
