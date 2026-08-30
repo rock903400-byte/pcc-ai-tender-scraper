@@ -532,17 +532,28 @@ def build_csv_bytes(rows: list) -> bytes:
     return output.getvalue().encode("utf-8-sig")
 
 
-@st.cache_data(show_spinner=False)
-def cached_excel_bytes(all_json: str, matched_json: str) -> bytes:
-    all_tenders = json.loads(all_json) if all_json else []
-    matched_tenders = json.loads(matched_json) if matched_json else []
-    return build_excel_bytes(all_tenders, matched_tenders)
+def rows_fingerprint(rows: list) -> str:
+    """以 pk（或標案案號）序列產生輕量指紋，用於 cache key。"""
+    import hashlib
+
+    h = hashlib.md5()
+    h.update(str(len(rows)).encode())
+    for r in rows:
+        h.update((r.get("pk") or r.get("標案案號") or "").encode("utf-8"))
+        h.update(b"|")
+        h.update((r.get("決標方式") or "").encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
 
 
 @st.cache_data(show_spinner=False)
-def cached_csv_bytes(rows_json: str) -> bytes:
-    rows = json.loads(rows_json) if rows_json else []
-    return build_csv_bytes(rows)
+def cached_excel_bytes(fingerprint: str, _all_tenders: list, _matched_tenders: list) -> bytes:
+    return build_excel_bytes(_all_tenders, _matched_tenders)
+
+
+@st.cache_data(show_spinner=False)
+def cached_csv_bytes(fingerprint: str, _rows: list) -> bytes:
+    return build_csv_bytes(_rows)
 
 
 def auto_export_backup(all_tenders: list, matched_tenders: list):
@@ -1452,11 +1463,10 @@ with tab_matched:
         st.markdown("**匯出**")
         export_rows = filtered if filtered else base_rows
         if export_rows:
-            all_json = json.dumps(st.session_state.tenders_all, ensure_ascii=False)
-            matched_json = json.dumps(export_rows, ensure_ascii=False)
-            excel_bytes = cached_excel_bytes(all_json, matched_json)
-            csv_json = json.dumps(export_rows, ensure_ascii=False)
-            csv_bytes = cached_csv_bytes(csv_json)
+            excel_fp = f"{rows_fingerprint(st.session_state.tenders_all)}_{rows_fingerprint(export_rows)}"
+            excel_bytes = cached_excel_bytes(excel_fp, st.session_state.tenders_all, export_rows)
+            csv_fp = rows_fingerprint(export_rows)
+            csv_bytes = cached_csv_bytes(csv_fp, export_rows)
             suffix = re.sub(r"[^\w一-鿿]+", "_", f"{st.session_state.active_attr_target}{st.session_state.active_award_target}").strip("_")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             col_dl1, col_dl2 = st.columns(2)
@@ -1589,8 +1599,7 @@ with tab_all:
 
         st.divider()
         if st.session_state.tenders_all:
-            all_json2 = json.dumps(st.session_state.tenders_all, ensure_ascii=False)
-            csv_all_bytes = cached_csv_bytes(all_json2)
+            csv_all_bytes = cached_csv_bytes(rows_fingerprint(st.session_state.tenders_all), st.session_state.tenders_all)
             st.download_button(
                 "📄 下載 CSV（全部標案）",
                 data=csv_all_bytes,
@@ -1679,7 +1688,7 @@ with tab_watchlist:
 
         with col_wl_act3:
             st.write("")
-            csv_wl_bytes = cached_csv_bytes(json.dumps(watchlist_items, ensure_ascii=False))
+            csv_wl_bytes = cached_csv_bytes(rows_fingerprint(watchlist_items), watchlist_items)
             st.download_button(
                 "📄 匯出追蹤清單 CSV",
                 data=csv_wl_bytes,
