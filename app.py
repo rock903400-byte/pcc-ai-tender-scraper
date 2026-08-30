@@ -867,8 +867,8 @@ def render_analytics_dashboard(tenders: list, qualified: list, keyword_hits: lis
                 for a in sorted_agencies
             ])
             chart_agency = alt.Chart(agency_df).mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4).encode(
-                x=alt.Y("招標機關:N", sort="-x", title="機關名稱"),
-                y=alt.X("標案筆數:Q", title="標案筆數"),
+                x=alt.X("標案筆數:Q", title="標案筆數"),
+                y=alt.Y("招標機關:N", sort="-x", title="機關名稱"),
                 color=alt.Color("累積預算(萬元):Q", scale=alt.Scale(scheme="tealblues")),
                 tooltip=["招標機關", "標案筆數", "累積預算(萬元)"],
             ).properties(height=320)
@@ -891,8 +891,8 @@ def render_analytics_dashboard(tenders: list, qualified: list, keyword_hits: lis
             sorted_kws = sorted(kw_counts.items(), key=lambda x: x[1], reverse=True)[:12]
             kw_df = pd.DataFrame([{"關鍵字": k[0], "命中次數": k[1]} for k in sorted_kws])
             chart_kw = alt.Chart(kw_df).mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4).encode(
-                x=alt.Y("關鍵字:N", sort="-x", title="關鍵字"),
-                y=alt.X("命中次數:Q", title="命中標案筆數"),
+                x=alt.X("命中次數:Q", title="命中標案筆數"),
+                y=alt.Y("關鍵字:N", sort="-x", title="關鍵字"),
                 color=alt.Color("命中次數:Q", scale=alt.Scale(scheme="purples")),
                 tooltip=["關鍵字", "命中次數"],
             ).properties(height=320)
