@@ -134,8 +134,23 @@ def table_height(row_count: int, max_rows: int = 18, cap: int = 580) -> int:
     return min(cap, 80 + 35 * min(row_count, max_rows))
 
 
-def render_filter_panel(key_prefix: str) -> dict:
-    """渲染快速搜尋與進階篩選器，回傳過濾參數 dict。"""
+def render_filter_panel(key_prefix: str, rows: list = None) -> dict:
+    """渲染快速搜尋與進階篩選器，回傳過濾參數 dict。（C4：預算上限依資料驅動）"""
+    import math
+    # 依實際資料計算上限，進位到百萬元整，空資料沿用 2000
+    if rows:
+        max_wan = max([core.parse_amount(t.get("預算金額", "")) for t in rows] + [0]) / 10000.0
+        slider_max = int(math.ceil(max_wan / 100.0) * 100) or 2000
+        # 確保至少 2000，避免過小的資料集導致滑桿過窄
+        if slider_max < 2000:
+            # 若資料最大值小於 2000，仍保留 2000 作為預設上限，避免頻繁變動
+            # 但若資料有 3 億等大額，slider_max 會自動放大
+            pass
+        # 為避免上限過小，實際採用 max(slider_max, 2000) 的邏輯會讓小資料集仍顯示 2000
+        # 這裡改為：若資料最大值計算出的上限小於 2000，仍用 2000；否則用計算值
+        slider_max = max(slider_max, 2000) if max_wan <= 2000 else slider_max
+    else:
+        slider_max = 2000
     col_q, col_exp = st.columns([3, 1])
     with col_q:
         q = st.text_input("🔍 快速搜尋（機關 / 案名 / 案號 / 關鍵字）", key=f"filter_{key_prefix}", placeholder="輸入關鍵字即時過濾…")
@@ -148,18 +163,21 @@ def render_filter_panel(key_prefix: str) -> dict:
             budget_range = st.slider(
                 "預算金額範圍 (萬元)",
                 min_value=0,
-                max_value=2000,
-                value=(0, 2000),
+                max_value=slider_max,
+                value=(0, slider_max),
                 step=50,
                 key=f"budget_slider_{key_prefix}",
-                help="設為 0 代表不設下限/上限；超過 2,000 萬的標案在上限為 2,000 時仍會納入",
+                help=f"上限依本次資料自動調整至 {slider_max} 萬元，超過上限的標案將被篩掉",
             )
         with fc2:
             urgency_sel = st.selectbox("截止投標急迫度", options=URGENCY_OPTIONS, key=f"urgency_sel_{key_prefix}")
         with fc3:
             award_status_sel = st.selectbox("決標校驗狀態", options=AWARD_STATUS_FILTER_OPTIONS, key=f"award_sel_{key_prefix}")
     min_b = budget_range[0] if budget_range[0] > 0 else 0
-    max_b = budget_range[1] if budget_range[1] < 2000 else 0
+    max_b = budget_range[1]  # 上限即上限，不再有「等於 max 仍納入超過者」特例
+    # 若上限為 0（理論上不應發生，因 slider 最小為 0 且 max 至少 2000），則視為不設限
+    if max_b == 0:
+        max_b = 0
     return {"query": q, "min_budget_wan": min_b, "max_budget_wan": max_b, "urgency": urgency_sel, "award_status": award_status_sel}
 
 
@@ -1213,7 +1231,7 @@ with tab_matched:
     else:
         base_rows = _qualified if st.session_state.include_misses else _keyword_hits
 
-        filt = render_filter_panel("matched")
+        filt = render_filter_panel("matched", base_rows)
         filtered = build_advanced_display_rows(
             base_rows,
             hide_pending_filter=st.session_state.hide_pending,
@@ -1278,7 +1296,7 @@ with tab_all:
             unsafe_allow_html=True,
         )
     else:
-        filt_all = render_filter_panel("all")
+        filt_all = render_filter_panel("all", st.session_state.tenders_all)
         filtered_all = build_advanced_display_rows(
             st.session_state.tenders_all,
             hide_pending_filter=False,
