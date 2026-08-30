@@ -45,6 +45,7 @@ from ui_logic import (
     KEYWORDS_MAX_WORDS,
     KEYWORDS_MAX_WORD_LEN,
     PENDING_PREFIX,
+    SORT_OPTIONS,
     award_composition_frame,
     budget_tier_frame,
     build_advanced_display_rows,
@@ -56,6 +57,7 @@ from ui_logic import (
     parse_deadline_date,
     sanitize_excel_value,
     sanitize_rows,
+    sort_tenders,
     tenders_to_dataframe,
     top_agencies_frame,
     urgency_bins_frame,
@@ -111,7 +113,7 @@ def get_tender_column_config():
         "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
         "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
         "截止投標": st.column_config.TextColumn("截止投標", width="small"),
-        "剩餘天數": st.column_config.TextColumn("剩餘天數", width="small", help="🔥≤3天 ⏳4-7天 📅8-14天 🗓️>14天 已截標/— 為特殊狀態；排序請用「截止投標」欄"),
+        "剩餘天數": st.column_config.TextColumn("剩餘天數", width="small", help="🔥≤3天 ⏳4-7天 📅8-14天 🗓️>14天 已截標/— 為特殊狀態；上方「排序」選單可做數值排序"),
         "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
         "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small", help="點擊開啟官方公告頁面"),
     }
@@ -127,29 +129,42 @@ def table_height(row_count: int, max_rows: int = 18, cap: int = 580) -> int:
 
 
 def render_filter_panel(key_prefix: str, rows: list = None) -> dict:
-    """渲染快速搜尋與進階篩選器，回傳過濾參數 dict。（C4：預算上限依資料驅動）"""
+    """渲染快速搜尋與進階篩選器，回傳過濾參數 dict。（C4：預算上限依資料驅動，9分版新增機關篩選/排序/一鍵清除）"""
     import math
+    from collections import Counter
     # 依實際資料計算上限，進位到百萬元整，空資料沿用 2000
     if rows:
         max_wan = max([core.parse_amount(t.get("預算金額", "")) for t in rows] + [0]) / 10000.0
         slider_max = int(math.ceil(max_wan / 100.0) * 100) or 2000
-        # 確保至少 2000，避免過小的資料集導致滑桿過窄
         if slider_max < 2000:
-            # 若資料最大值小於 2000，仍保留 2000 作為預設上限，避免頻繁變動
-            # 但若資料有 3 億等大額，slider_max 會自動放大
             pass
-        # 為避免上限過小，實際採用 max(slider_max, 2000) 的邏輯會讓小資料集仍顯示 2000
-        # 這裡改為：若資料最大值計算出的上限小於 2000，仍用 2000；否則用計算值
         slider_max = max(slider_max, 2000) if max_wan <= 2000 else slider_max
+        # 機關選項：依本次結果 Top 30
+        cnt = Counter(t.get("招標機關", "未知機關") for t in rows if t.get("招標機關"))
+        agency_options = [a for a, _ in cnt.most_common(30)]
     else:
         slider_max = 2000
+        agency_options = []
     col_q, col_exp = st.columns([3, 1])
     with col_q:
         q = st.text_input("🔍 快速搜尋（機關 / 案名 / 案號 / 關鍵字）", key=f"filter_{key_prefix}", placeholder="輸入關鍵字即時過濾…")
     with col_exp:
         st.write("")
-        st.caption("👇 可展開下方進行預算、急迫度多維度篩選")
-    with st.expander("🎛️ 進階條件篩選器 (預算金額 / 截標急迫度 / 決標狀態)", expanded=False):
+        st.caption("👇 可展開下方進行多維度篩選與排序")
+    # 進階篩選器：預設收合，但若已有篩選則自動展開提升可見性
+    has_active = False
+    try:
+        if st.session_state.get(f"budget_slider_{key_prefix}", (0, slider_max)) != (0, slider_max):
+            has_active = True
+        if st.session_state.get(f"urgency_sel_{key_prefix}", "全部") != "全部":
+            has_active = True
+        if st.session_state.get(f"award_sel_{key_prefix}", "全部") != "全部":
+            has_active = True
+        if st.session_state.get(f"agency_{key_prefix}", []):
+            has_active = True
+    except Exception:
+        has_active = False
+    with st.expander("🎛️ 進階條件篩選器 (預算金額 / 截標急迫度 / 決標狀態 / 招標機關)", expanded=has_active):
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             budget_range = st.slider(
@@ -165,16 +180,62 @@ def render_filter_panel(key_prefix: str, rows: list = None) -> dict:
             urgency_sel = st.selectbox("截止投標急迫度", options=URGENCY_OPTIONS, key=f"urgency_sel_{key_prefix}")
         with fc3:
             award_status_sel = st.selectbox("決標校驗狀態", options=AWARD_STATUS_FILTER_OPTIONS, key=f"award_sel_{key_prefix}")
+        # 招標機關多選（第二列，全寬）
+        if agency_options:
+            agency_sel = st.multiselect(
+                "🏛️ 招標機關篩選（可複選，子字串比對）",
+                options=agency_options,
+                key=f"agency_{key_prefix}",
+                placeholder="全部機關",
+                help="依本次結果 Top 30 機關，支援子字串比對，可複選過濾",
+            )
+        else:
+            agency_sel = st.multiselect(
+                "🏛️ 招標機關篩選",
+                options=[],
+                key=f"agency_{key_prefix}",
+                placeholder="無可選機關",
+                disabled=True,
+            )
+            agency_sel = []
+        # 已套用摘要 + 清除按鈕
+        active_tags = []
+        if budget_range != (0, slider_max):
+            active_tags.append(f"預算 {budget_range[0]}~{budget_range[1]}萬")
+        if urgency_sel != "全部":
+            active_tags.append(urgency_sel)
+        if award_status_sel != "全部":
+            active_tags.append(award_status_sel)
+        if agency_sel:
+            active_tags.append(f"機關 {len(agency_sel)} 項")
+        if active_tags:
+            st.caption(f"🔎 已套用 {len(active_tags)} 項：{' · '.join(active_tags)}")
+        if st.button("🧹 清除進階篩選", key=f"clear_filter_{key_prefix}", help="重置預算、急迫度、決標狀態與機關篩選"):
+            # 重置為預設值（直接賦值避免刪除 widget key 時的競態）
+            st.session_state[f"budget_slider_{key_prefix}"] = (0, slider_max)
+            st.session_state[f"urgency_sel_{key_prefix}"] = "全部"
+            st.session_state[f"award_sel_{key_prefix}"] = "全部"
+            st.session_state[f"agency_{key_prefix}"] = []
+            st.rerun()
+    # 排序控制器：常駐顯示，解決剩餘天數文字排序不準（C2 遺留）
+    col_sort, col_info = st.columns([2, 3])
+    with col_sort:
+        sort_opt = st.selectbox("↕️ 排序方式", options=SORT_OPTIONS, key=f"sort_{key_prefix}", help="「剩餘天數」為文字，此處提供數值排序；預設為公告日期新→舊")
+    with col_info:
+        st.write("")
+        if active_tags:
+            st.caption(f"⬆️ 排序已設為「{sort_opt}」· 篩選已套用 {len(active_tags)} 項")
+        else:
+            st.caption(f"⬆️ 排序已設為「{sort_opt}」· 尚未套用進階篩選")
     min_b = budget_range[0] if budget_range[0] > 0 else 0
-    max_b = budget_range[1]  # 上限即上限，不再有「等於 max 仍納入超過者」特例
-    # 若上限為 0（理論上不應發生，因 slider 最小為 0 且 max 至少 2000），則視為不設限
+    max_b = budget_range[1]
     if max_b == 0:
         max_b = 0
-    return {"query": q, "min_budget_wan": min_b, "max_budget_wan": max_b, "urgency": urgency_sel, "award_status": award_status_sel}
+    return {"query": q, "min_budget_wan": min_b, "max_budget_wan": max_b, "urgency": urgency_sel, "award_status": award_status_sel, "agencies": agency_sel, "sort": sort_opt}
 
 
 def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int = 18, cap: int = 580, selectable: bool = False) -> None:
-    """渲染標案表格（共用欄位設定與高度計算）。支援可選取模式（C3）。"""
+    """渲染標案表格（共用欄位設定與高度計算）。支援可選取模式（C3），9分版優化 caption 與空狀態。"""
     if not rows:
         return
     df = tenders_to_dataframe(rows, st.session_state.active_award_target)
@@ -191,7 +252,7 @@ def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int
             selection_mode="multi-row",
             key=f"table_{key_prefix}",
         )
-        st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄 · 勾選列後按下方按鈕加入追蹤")
+        st.caption(caption + " · 勾選列後按下方按鈕加入追蹤 · 欄頭點擊可再排序")
         # 顯示缺少案號提示（不可選）
         missing = sum(1 for r in rows if not tender_key(r))
         if missing > 0:
@@ -229,7 +290,52 @@ def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int
             height=table_height(len(display_df), max_rows, cap),
             column_config=TENDER_COLUMN_CONFIG,
         )
-        st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄")
+        st.caption(caption + " · 欄頭點擊可排序")
+
+
+def paginate_rows(rows: list, key_prefix: str, default_limit: int = 100) -> tuple:
+    """分頁控制器：處理每頁顯示與頁碼按鈕，回傳 (display_rows, pagination_caption)。"""
+    DISPLAY_LIMIT_OPTIONS = [50, 100, 300, 1000]
+    if not rows:
+        return rows, ""
+    # 決定預設索引
+    try:
+        default_idx = DISPLAY_LIMIT_OPTIONS.index(default_limit)
+    except ValueError:
+        default_idx = 1
+    col_limit, _ = st.columns([1, 3])
+    with col_limit:
+        limit_sel = st.selectbox(
+            "📄 每頁顯示",
+            options=DISPLAY_LIMIT_OPTIONS + ["全部"],
+            index=default_idx,
+            key=f"limit_{key_prefix}",
+            help="避免一次渲染 6000 筆造成卡頓",
+        )
+    if limit_sel != "全部" and len(rows) > int(limit_sel):
+        page_total = (len(rows) + int(limit_sel) - 1) // int(limit_sel)
+        page = st.session_state.get(f"page_{key_prefix}", 1)
+        if page > page_total:
+            page = 1
+            st.session_state[f"page_{key_prefix}"] = 1
+        c_prev, c_info, c_next = st.columns([1, 3, 1])
+        with c_prev:
+            if st.button("◀ 上一頁", key=f"prev_{key_prefix}", disabled=(page <= 1)):
+                st.session_state[f"page_{key_prefix}"] = max(1, page - 1)
+                st.rerun()
+        with c_info:
+            st.caption(f"第 {page} / {page_total} 頁 · 共 {len(rows)} 筆，顯示 {int(limit_sel)} 筆/頁")
+        with c_next:
+            if st.button("下一頁 ▶", key=f"next_{key_prefix}", disabled=(page >= page_total)):
+                st.session_state[f"page_{key_prefix}"] = min(page_total, page + 1)
+                st.rerun()
+        start = (page - 1) * int(limit_sel)
+        display = rows[start:start + int(limit_sel)]
+        return display, f"第 {page}/{page_total} 頁"
+    else:
+        if f"page_{key_prefix}" in st.session_state:
+            st.session_state[f"page_{key_prefix}"] = 1
+        return rows, ""
 
 
 # ==================== 檔案路徑與狀態 ====================
@@ -1294,16 +1400,23 @@ with tab_matched:
             max_budget_wan=filt["max_budget_wan"],
             urgency=filt["urgency"],
             award_status=filt["award_status"],
+            selected_agencies=filt.get("agencies", []),
         )
+        # 數值排序（解決剩餘天數文字排序不準）
+        filtered_sorted = sort_tenders(filtered, filt.get("sort", SORT_OPTIONS[0]))
 
-        if not filtered:
+        if not filtered_sorted:
             st.warning("無符合篩選條件的精選標案。請調整搜尋關鍵字或放寬進階篩選條件。")
         else:
-            render_tender_table(filtered, "matched", f"顯示 {len(filtered)} / {len(base_rows)} 筆（原始符合條件 {len(_qualified)} 筆） · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符", selectable=True)
+            display_rows, pag_cap = paginate_rows(filtered_sorted, "matched", 100)
+            caption_base = f"顯示 {len(display_rows)} / {len(filtered_sorted)} 筆（已篩選） / 原始符合條件 {len(_qualified)} 筆"
+            if pag_cap:
+                caption_base += f" · {pag_cap}"
+            render_tender_table(display_rows, "matched", caption_base + " · 點擊欄頭可再排序 · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符", selectable=True)
 
         st.divider()
         st.markdown("**匯出**")
-        export_rows = filtered if filtered else base_rows
+        export_rows = filtered_sorted if filtered_sorted else base_rows
         if export_rows:
             excel_fp = f"{rows_fingerprint(st.session_state.tenders_all)}_{rows_fingerprint(export_rows)}"
             excel_bytes = cached_excel_bytes(excel_fp, st.session_state.tenders_all, export_rows)
@@ -1347,12 +1460,18 @@ with tab_all:
             max_budget_wan=filt_all["max_budget_wan"],
             urgency=filt_all["urgency"],
             award_status=filt_all["award_status"],
+            selected_agencies=filt_all.get("agencies", []),
         )
+        filtered_all_sorted = sort_tenders(filtered_all, filt_all.get("sort", SORT_OPTIONS[0]))
 
-        if not filtered_all:
+        if not filtered_all_sorted:
             st.warning("無符合篩選條件的標案。")
         else:
-            render_tender_table(filtered_all, "all", f"顯示 {len(filtered_all)} / {len(st.session_state.tenders_all)} 筆 · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面", selectable=True)
+            display_rows_all, pag_cap_a = paginate_rows(filtered_all_sorted, "all", 100)
+            caption_all = f"顯示 {len(display_rows_all)} / {len(filtered_all_sorted)} 筆（已篩選） / 共 {len(st.session_state.tenders_all)} 筆"
+            if pag_cap_a:
+                caption_all += f" · {pag_cap_a}"
+            render_tender_table(display_rows_all, "all", caption_all + " · 點擊欄頭可再排序 · 點擊「詳細連結」開啟官方頁面", selectable=True)
 
         st.divider()
         if st.session_state.tenders_all:
@@ -1449,16 +1568,50 @@ with tab_watchlist:
     if not watchlist_items:
         render_empty_state("⭐", "目前追蹤清單尚無標案", '在「🏆 精選」或「📋 所有標案」勾選表格列並按「加入追蹤」即可將關注的標案加入此清單。<br>追蹤資料會自動保存於 <code>output/watchlist.json</code>，下次開啟程式自動保留。')
     else:
+        # 排序控制器（ watchlist 亦支援數值排序，解決剩餘天數文字排序問題）
+        col_sort_wl, col_info_wl = st.columns([2, 3])
+        with col_sort_wl:
+            sort_wl = st.selectbox("↕️ 排序方式", options=SORT_OPTIONS, key="sort_watchlist", help="追蹤清單亦支援數值排序")
+        with col_info_wl:
+            st.write("")
+            st.caption(f"已選「{sort_wl}」· 追蹤清單支援與主表格一致的排序")
+        watchlist_sorted = sort_tenders(watchlist_items, sort_wl)
         # 統計已截標（用 get_days_remaining，與篩選器一致）
-        expired_count = sum(1 for t in watchlist_items if (get_days_remaining(t.get("截止投標", "")) is not None and get_days_remaining(t.get("截止投標", "")) < 0))
-        caption_wl = f"📌 共收藏 {len(watchlist_items)} 筆標案 · 資料永久保存於 `output/watchlist.json`"
+        expired_count = sum(1 for t in watchlist_sorted if (get_days_remaining(t.get("截止投標", "")) is not None and get_days_remaining(t.get("截止投標", "")) < 0))
+        caption_wl = f"📌 共收藏 {len(watchlist_sorted)} 筆標案 · 資料永久保存於 `output/watchlist.json`"
         if expired_count > 0:
             caption_wl += f" · 其中 {expired_count} 筆已截標"
         # 若有快照來源，提醒使用者部分為快照
-        snapshot_count = sum(1 for t in watchlist_items if t.get("_watchlist_source") == "快照")
+        snapshot_count = sum(1 for t in watchlist_sorted if t.get("_watchlist_source") == "快照")
         if snapshot_count > 0:
             caption_wl += f" · {snapshot_count} 筆為快照（查無最新資料）"
-        render_tender_table(watchlist_items, "watchlist", caption_wl, max_rows=15, cap=500)
+        # 大追蹤清單分頁（>50 筆時）
+        WL_LIMIT = 50
+        if len(watchlist_sorted) > WL_LIMIT:
+            page_wl = st.session_state.get("page_watchlist", 1)
+            page_total_wl = (len(watchlist_sorted) + WL_LIMIT - 1) // WL_LIMIT
+            if page_wl > page_total_wl:
+                page_wl = 1
+                st.session_state["page_watchlist"] = 1
+            c_prev_wl, c_info_wl2, c_next_wl = st.columns([1, 3, 1])
+            with c_prev_wl:
+                if st.button("◀ 上一頁", key="prev_wl", disabled=(page_wl <= 1)):
+                    st.session_state["page_watchlist"] = max(1, page_wl - 1)
+                    st.rerun()
+            with c_info_wl2:
+                st.caption(f"第 {page_wl} / {page_total_wl} 頁 · 共 {len(watchlist_sorted)} 筆")
+            with c_next_wl:
+                if st.button("下一頁 ▶", key="next_wl", disabled=(page_wl >= page_total_wl)):
+                    st.session_state["page_watchlist"] = min(page_total_wl, page_wl + 1)
+                    st.rerun()
+            start_wl = (page_wl - 1) * WL_LIMIT
+            display_wl = watchlist_sorted[start_wl:start_wl + WL_LIMIT]
+            caption_wl += f" · 第 {page_wl}/{page_total_wl} 頁"
+        else:
+            display_wl = watchlist_sorted
+            if "page_watchlist" in st.session_state:
+                st.session_state["page_watchlist"] = 1
+        render_tender_table(display_wl, "watchlist", caption_wl, max_rows=15, cap=500)
 
         col_wl_act1, col_wl_act2, col_wl_act3 = st.columns([2, 1, 1])
         with col_wl_act1:
@@ -1489,7 +1642,8 @@ with tab_watchlist:
 
         with col_wl_act3:
             st.write("")
-            csv_wl_bytes = cached_csv_bytes(rows_fingerprint(watchlist_items), watchlist_items)
+            # 匯出完整排序後的清單（非僅當頁）
+            csv_wl_bytes = cached_csv_bytes(rows_fingerprint(watchlist_sorted), watchlist_sorted)
             st.download_button(
                 "📄 匯出追蹤清單 CSV",
                 data=csv_wl_bytes,

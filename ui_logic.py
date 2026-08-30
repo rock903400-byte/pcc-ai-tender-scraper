@@ -51,6 +51,11 @@ def is_award_pending(tender: dict) -> bool:
             and "待確認" in tender.get("決標方式", ""))
 
 
+def _today() -> date:
+    """可被測試 monkeypatch 的今日取得層，避免跨午夜 flake。"""
+    return date.today()
+
+
 def parse_deadline_date(deadline_str: str) -> date:
     """解析截止投標字串為西元 date 物件，失敗回傳 None。"""
     if not deadline_str or not isinstance(deadline_str, str):
@@ -73,7 +78,7 @@ def get_days_remaining(deadline_str: str) -> int:
     d = parse_deadline_date(deadline_str)
     if d is None:
         return None
-    return (d - date.today()).days
+    return (d - _today()).days
 
 
 def sanitize_excel_value(val):
@@ -309,6 +314,8 @@ def top_agencies_frame(tenders: list, top_n: int = 10) -> pd.DataFrame:
             agency_stats[agency] = {"count": 0, "total_amt": 0}
         agency_stats[agency]["count"] += 1
         agency_stats[agency]["total_amt"] += amt
+    if not agency_stats:
+        return pd.DataFrame(columns=["招標機關", "標案筆數", "累積預算(萬元)"])
     sorted_agencies = sorted(agency_stats.items(), key=lambda x: x[1]["count"], reverse=True)[:top_n]
     agency_df = pd.DataFrame([
         {
@@ -366,6 +373,53 @@ def urgency_bins_frame(tenders: list) -> pd.DataFrame:
         "標案數量": list(urgency_bins.values()),
     })
     return urgency_df
+
+
+SORT_OPTIONS = [
+    "預設（公告日期 新→舊）",
+    "截止投標 近→遠（剩餘天數）",
+    "截止投標 遠→近",
+    "預算金額 高→低",
+    "預算金額 低→高",
+    "機關名稱 A→Z",
+]
+
+
+def sort_tenders(tenders: list, sort_option: str) -> list:
+    """依指定排序選項回傳新清單，不改動原清單。"""
+    if not tenders or not sort_option or sort_option == SORT_OPTIONS[0]:
+        # 預設：公告日期 新→舊，解析失敗者置底
+        def _key(t):
+            d = parse_deadline_date(t.get("公告日期", ""))
+            # 有日期者在前，無日期者在後；同組內依字串倒序由 sorted reverse 處理
+            return (d is not None, d or date.min)
+        return sorted(tenders, key=_key, reverse=True)
+    if sort_option == "截止投標 近→遠（剩餘天數）":
+        def _k(t):
+            days = get_days_remaining(t.get("截止投標", ""))
+            if days is None:
+                return (1, 99999)
+            if days < 0:
+                return (1, 99998)
+            return (0, days)
+        return sorted(tenders, key=_k)
+    if sort_option == "截止投標 遠→近":
+        def _k2(t):
+            days = get_days_remaining(t.get("截止投標", ""))
+            if days is None or days < 0:
+                return (1, -99999)
+            return (0, -days)
+        return sorted(tenders, key=_k2)
+    if sort_option == "預算金額 高→低":
+        return sorted(tenders, key=lambda t: core.parse_amount(t.get("預算金額", "")) if core.parse_amount(t.get("預算金額", "")) > 0 else -1, reverse=True)
+    if sort_option == "預算金額 低→高":
+        def _bk(t):
+            v = core.parse_amount(t.get("預算金額", ""))
+            return v if v > 0 else float("inf")
+        return sorted(tenders, key=_bk)
+    if sort_option == "機關名稱 A→Z":
+        return sorted(tenders, key=lambda t: t.get("招標機關", ""))
+    return tenders
 
 
 def kpi_summary(tenders: list) -> dict:

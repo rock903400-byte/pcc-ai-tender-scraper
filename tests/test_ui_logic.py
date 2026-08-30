@@ -614,11 +614,13 @@ class TestRemainingDays:
         assert cols.index("剩餘天數") == cols.index("截止投標") + 1
 
     def test_剩餘天數排序提示(self):
-        # 驗證 app.py 的 TENDER_COLUMN_CONFIG 對剩餘天數有 help 提示
+        # 驗證 app.py 對剩餘天數有排序支援（9分版改為獨立排序選單，不再僅靠 caption 提示）
         import pathlib as pl
         app_text = pl.Path("app.py").read_text(encoding="utf-8")
         assert "剩餘天數" in app_text
-        assert "排序請用" in app_text
+        assert "排序" in app_text
+        # 9分版新增數值排序控制器
+        assert "sort_tenders" in app_text or "SORT_OPTIONS" in app_text
 
 
 class TestKpiSummary:
