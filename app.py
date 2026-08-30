@@ -1159,13 +1159,6 @@ def _search_polling_fragment():
     else:
         status_placeholder.info("🔍 搜尋中… 請稍候，可按「停止搜尋」中斷")
 
-    if st.button("⏹️ 停止搜尋", width="stretch", key="stop_search_btn"):
-        evt = ss_get("stop_event")
-        if evt:
-            evt.set()
-            append_log("⏹ 已要求停止，等待當前請求完成後收尾…")
-        st.rerun()
-
     if q is not None:
         while not q.empty():
             try:
@@ -1207,18 +1200,12 @@ def _search_polling_fragment():
 
 if st.session_state.is_running:
     _search_polling_fragment()
-    progress_placeholder.progress(int(ss_get("search_progress", 0)))
-    _s = ss_get("search_status")
-    if _s:
-        typ, msg = _s if isinstance(_s, tuple) else ("info", str(_s))
-        if typ == "success":
-            status_placeholder.success(msg)
-        elif typ == "error":
-            status_placeholder.error(msg)
-        elif typ == "warning":
-            status_placeholder.warning(msg)
-        else:
-            status_placeholder.info(msg)
+    if st.button("⏹️ 停止搜尋", width="stretch", key="stop_search_btn"):
+        evt = ss_get("stop_event")
+        if evt:
+            evt.set()
+            append_log("⏹ 已要求停止，等待當前請求完成後收尾…")
+        st.rerun()
 
 
 @st.fragment(run_every=0.9)
@@ -1263,16 +1250,16 @@ def _trickle_polling_fragment():
         st.session_state.is_trickling = False
     else:
         status_placeholder.info("🔄 補齊中…（約 1-2 分鐘，頁面可繼續操作）")
-        if st.button("⏹️ 停止補齊", width="stretch", key="stop_trickle_btn"):
-            evt = ss_get("trickle_stop_event")
-            if evt:
-                evt.set()
-                append_log("⏹ 已要求停止補齊…")
-            st.rerun()
 
 
 if st.session_state.is_trickling:
     _trickle_polling_fragment()
+    if st.button("⏹️ 停止補齊", width="stretch", key="stop_trickle_btn"):
+        evt = ss_get("trickle_stop_event")
+        if evt:
+            evt.set()
+            append_log("⏹ 已要求停止補齊…")
+        st.rerun()
 
 
 # ---------- 搜尋觸發 ----------
