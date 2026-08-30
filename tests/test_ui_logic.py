@@ -116,9 +116,8 @@ class TestGetDaysRemaining:
         assert ui_logic.get_days_remaining(None) is None
 
     def test_民國年輸入亦可計算(self):
-        # 115 年 = 2026，假設今日 2026 附近，115/01/01 在過去
-        # 只要能解析，非 None 即成功
-        roc_date = f"{date.today().year - 1911}/{(date.today() + timedelta(days=10)).strftime('%m/%d')}"
+        target = date.today() + timedelta(days=10)
+        roc_date = f"{target.year - 1911}/{target.month:02d}/{target.day:02d}"
         days = ui_logic.get_days_remaining(roc_date)
         assert days == 10
 
@@ -620,6 +619,65 @@ class TestRemainingDays:
         app_text = pl.Path("app.py").read_text(encoding="utf-8")
         assert "剩餘天數" in app_text
         assert "排序請用" in app_text
+
+
+class TestKpiSummary:
+    """kpi_summary 的聚合與 -0 萬元 bug 修正"""
+
+    def test_正常混合資料(self):
+        tenders = [
+            _make_tender(預算金額="1000000", 決標方式="最低標", 決標方式來源=core.AWARD_SOURCE_MIRROR),
+            _make_tender(預算金額="2000000", 決標方式="最有利標", 決標方式來源=core.AWARD_SOURCE_MIRROR),
+            _make_tender(預算金額="", 決標方式="最低標", 決標方式來源=core.AWARD_SOURCE_MIRROR),
+        ]
+        kpi = ui_logic.kpi_summary(tenders)
+        assert kpi["total_budget"] == 3000000.0
+        assert kpi["avg_budget"] == 1500000.0
+        assert kpi["max_amount"] == 2000000.0
+        assert kpi["max_tender_name"] == tenders[1]["標案名稱"]
+        assert kpi["total_count"] == 3
+        assert kpi["confirmed_count"] == 3
+        assert kpi["confirmed_ratio"] == 100.0
+
+    def test_全部預算未公開_max_amount為0不得為負(self):
+        tenders = [
+            _make_tender(預算金額="", 決標方式="最低標", 決標方式來源=core.AWARD_SOURCE_MIRROR),
+            _make_tender(預算金額="", 決標方式="最低標", 決標方式來源=core.AWARD_SOURCE_MIRROR),
+        ]
+        kpi = ui_logic.kpi_summary(tenders)
+        assert kpi["max_amount"] == 0
+        assert kpi["max_amount"] != -1.0
+        assert kpi["total_budget"] == 0
+        assert kpi["avg_budget"] == 0
+        # 顯示時應為 0 萬元而非 -0 萬元
+        assert f"{kpi['max_amount']/10000:.0f} 萬元" == "0 萬元"
+
+    def test_空清單全部回0不拋例外(self):
+        kpi = ui_logic.kpi_summary([])
+        assert kpi["total_budget"] == 0
+        assert kpi["avg_budget"] == 0
+        assert kpi["max_amount"] == 0
+        assert kpi["max_tender_name"] == ""
+        assert kpi["confirmed_count"] == 0
+        assert kpi["confirmed_ratio"] == 0
+        assert kpi["total_count"] == 0
+
+    def test_confirmed_ratio分母為全部且空清單為0(self):
+        tenders = [
+            _make_tender(決標方式="最低標", 決標方式來源=core.AWARD_SOURCE_MIRROR),
+            _make_tender(決標方式="公開取得 (待確認)", 決標方式來源=core.AWARD_SOURCE_ESTIMATED),
+        ]
+        kpi = ui_logic.kpi_summary(tenders)
+        assert kpi["confirmed_count"] == 1
+        assert kpi["confirmed_ratio"] == 50.0
+        assert kpi["total_count"] == 2
+
+    def test_只有一筆時平均等於總和(self):
+        t = _make_tender(預算金額="5000000")
+        kpi = ui_logic.kpi_summary([t])
+        assert kpi["total_budget"] == 5000000.0
+        assert kpi["avg_budget"] == 5000000.0
+        assert kpi["max_amount"] == 5000000.0
 
 
 class TestUiLogicNoStreamlit:

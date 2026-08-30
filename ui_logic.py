@@ -366,3 +366,36 @@ def urgency_bins_frame(tenders: list) -> pd.DataFrame:
         "標案數量": list(urgency_bins.values()),
     })
     return urgency_df
+
+
+def kpi_summary(tenders: list) -> dict:
+    """回傳 KPI 彙總，唯一行為變更：無有效預算時 max_amount 回 0 而非 -1.0。"""
+    amounts = [core.parse_amount(t.get("預算金額", "")) for t in tenders]
+    valid_amounts = [a for a in amounts if a > 0]
+    total_budget = sum(valid_amounts)
+    avg_budget = total_budget / len(valid_amounts) if valid_amounts else 0
+    if valid_amounts:
+        # 僅在有有效預算時取最大值，避免全為 -1.0 時取到 -1.0
+        max_tender = max(tenders, key=lambda t: core.parse_amount(t.get("預算金額", "")))
+        max_amount = core.parse_amount(max_tender.get("預算金額", ""))
+        # 防呆：若最大值仍為無效（理論上不會，因 valid 非空），則回 0
+        if max_amount <= 0:
+            max_amount = 0
+            max_tender_name = ""
+        else:
+            max_tender_name = max_tender.get("標案名稱", "")
+    else:
+        max_tender = None
+        max_amount = 0
+        max_tender_name = ""
+    confirmed_count = sum(1 for t in tenders if core.is_award_confirmed(t))
+    confirmed_ratio = confirmed_count / len(tenders) * 100 if tenders else 0
+    return {
+        "total_budget": total_budget,
+        "avg_budget": avg_budget,
+        "max_amount": max_amount,
+        "max_tender_name": max_tender_name,
+        "confirmed_count": confirmed_count,
+        "confirmed_ratio": confirmed_ratio,
+        "total_count": len(tenders),
+    }

@@ -39,6 +39,12 @@ import streamlit as st
 import pcc_core as core
 from config import DEFAULT_KEYWORDS, USE_MIRROR_SOURCE
 from ui_logic import (
+    DISPLAY_COLUMNS,
+    DISQUALIFIED_PREFIX,
+    KEYWORDS_MAX_CHARS,
+    KEYWORDS_MAX_WORDS,
+    KEYWORDS_MAX_WORD_LEN,
+    PENDING_PREFIX,
     award_composition_frame,
     budget_tier_frame,
     build_advanced_display_rows,
@@ -46,6 +52,7 @@ from ui_logic import (
     get_days_remaining,
     is_award_pending,
     keyword_ranking_frame,
+    kpi_summary,
     parse_deadline_date,
     sanitize_excel_value,
     sanitize_rows,
@@ -80,37 +87,15 @@ AWARD_STATUS_FILTER_OPTIONS = [
     "🟠 僅待確認 (推估)",
 ]
 
-PENDING_PREFIX = "🟠 "
-DISQUALIFIED_PREFIX = "⚪ "
-
 OUTPUT_DIR = os.path.abspath("output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 WATCHLIST_FILENAME = "watchlist.json"
 
-DISPLAY_COLUMNS = [
-    "#",
-    "公告日期",
-    "招標機關",
-    "標案名稱",
-    "預算金額",
-    "決標方式",
-    "招標方式",
-    "決標方式來源",
-    "截止投標",
-    "剩餘天數",
-    "命中關鍵字",
-    "詳細連結",
-]
-
-
 MAX_LOG_LINES = 1000
 LOG_KEEP = 500
 MAX_OUTPUT_KEEP = 20
 RATE_LIMIT_SECONDS = 60
-KEYWORDS_MAX_CHARS = 500
-KEYWORDS_MAX_WORDS = 100
-KEYWORDS_MAX_WORD_LEN = 30
 
 # 單一定義的欄位設定，三個分頁共用（C1 重構，C2 新增剩餘天數）
 TENDER_COLUMN_CONFIG = {
@@ -738,23 +723,21 @@ def render_analytics_dashboard(tenders: list, qualified: list, keyword_hits: lis
         render_empty_state("📊", "尚未載入分析數據", "請先在左側設定條件並完成一次搜尋，即可即時查看標案市場大盤圖表")
         return
 
-    # 計算統計指標
-    amounts = [core.parse_amount(t.get("預算金額", "")) for t in tenders]
-    valid_amounts = [a for a in amounts if a > 0]
-    total_budget = sum(valid_amounts)
-    avg_budget = total_budget / len(valid_amounts) if valid_amounts else 0
-    max_tender = max(tenders, key=lambda t: core.parse_amount(t.get("預算金額", ""))) if tenders else None
-    max_amount = core.parse_amount(max_tender.get("預算金額", "")) if max_tender else 0
-
-    confirmed_count = sum(1 for t in tenders if core.is_award_confirmed(t))
-    confirmed_ratio = confirmed_count / len(tenders) * 100 if tenders else 0
+    # 計算統計指標（抽至 ui_logic.kpi_summary，僅排版留在此）
+    kpi = kpi_summary(tenders)
+    total_budget = kpi["total_budget"]
+    avg_budget = kpi["avg_budget"]
+    max_amount = kpi["max_amount"]
+    max_tender_name = kpi["max_tender_name"]
+    confirmed_count = kpi["confirmed_count"]
+    confirmed_ratio = kpi["confirmed_ratio"]
 
     # 頂部 KPI 卡片
     k1, k2, k3, k4 = st.columns(4)
     budget_yi = total_budget / 100000000.0
     k1.metric("💰 總預算規模", f"{budget_yi:.2f} 億元" if budget_yi >= 1 else f"{total_budget/10000:.0f} 萬元")
     k2.metric("📈 平均標案金額", f"{avg_budget/10000:.1f} 萬元")
-    k3.metric("🏆 最高單一預算", f"{max_amount/10000:.0f} 萬元", help=max_tender.get("標案名稱", "") if max_tender else "")
+    k3.metric("🏆 最高單一預算", f"{max_amount/10000:.0f} 萬元", help=max_tender_name)
     k4.metric("🛡️ 官方/鏡像確認率", f"{confirmed_ratio:.1f}%", delta=f"{confirmed_count}/{len(tenders)} 筆")
 
     st.write("")
