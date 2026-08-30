@@ -70,21 +70,26 @@
 ```text
 pcc-ai-tender-scraper/
 ├── app.py                   # Streamlit Web 應用程式入口（streamlit run app.py）
+├── ui_logic.py              # 前端純邏輯層（篩選、格式化、看板聚合；不依賴 streamlit，可離線測試）
 ├── crawler.py               # 命令列 CLI 入口
 ├── pcc_core.py              # 共用核心：連線、分頁、解析、決標方式判定、報表輸出
 ├── pcc_mirror.py            # 決標方式的主來源：公開資料鏡像 API（無額度限制）
 ├── config.py                # 關鍵字與篩選規則設定檔
-├── requirements.txt         # 執行期相依套件（streamlit + pandas + openpyxl）
+├── requirements.txt         # 執行期相依套件（streamlit + altair + pandas + openpyxl）
 ├── requirements-dev.txt     # 開發／測試相依套件
 ├── tests/                   # 離線單元測試（以真實回應存檔為 fixture）
 │   ├── conftest.py
 │   ├── fixtures/            # 政府採購網回應存檔，測試不需連網
 │   ├── test_pcc_core.py     # 核心邏輯（離線）
-│   └── test_pcc_mirror.py   # 鏡像來源與「鏡像優先、官網備援」流程（離線）
+│   ├── test_pcc_mirror.py   # 鏡像來源與「鏡像優先、官網備援」流程（離線）
+│   └── test_ui_logic.py     # 前端邏輯：日期解析、多維篩選、看板聚合、KPI（離線）
+├── docs/
+│   └── 前端改善工單.md       # 前端介面化改善的完整工單與驗收記錄
 └── output/                  # 搜尋結果與報表輸出目錄（已 gitignore）
     ├── award_cache.json     # 已確認決標方式的永久快取（跨次執行累積，90 天有效）
     ├── pending_queue.json   # 待確認標案佇列（補齊功能的取件來源）
-    └── ui_settings.json     # 上次使用的搜尋條件
+    ├── ui_settings.json     # 上次使用的搜尋條件
+    └── watchlist.json       # 追蹤清單（存標案 ID + 快照，載入時回填最新狀態）
 ```
 
 `app.py` 與 `crawler.py` 皆為薄薄的入口層，所有爬取與解析邏輯集中在 `pcc_core.py`，
