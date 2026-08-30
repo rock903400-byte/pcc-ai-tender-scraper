@@ -195,8 +195,8 @@ def parse_amount(text) -> float:
 
 # ==================== HTTP ====================
 
-def http_post(url: str, data: dict, max_retries: int = 3, timeout: int = 30) -> str:
-    """發送 POST 請求，失敗時採退避重試。"""
+def http_post(url: str, data: dict, max_retries: int = 3, timeout: int = 15) -> str:
+    """發送 POST 請求，失敗時採退避重試。Cloud 環境縮短 timeout 避免 90s 黑洞。"""
     encoded = urllib.parse.urlencode(data).encode("utf-8")
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -517,12 +517,18 @@ def parse_tender_rows(html_doc: str, keyword: str, col_index: dict = None) -> li
 # ==================== 分頁 ====================
 
 def parse_total_records(html_doc: str):
-    """解析「共有 N 筆資料」；無法解析時回傳 None。"""
+    """解析「共有 N 筆資料」；無法解析時回傳 None。含寬鬆後備避免正則失效。"""
     match = re.search(r"共有\s*<span[^>]*>\s*([\d,]+)\s*</span>\s*筆資料", html_doc)
     if not match:
         match = re.search(r"共有\s*([\d,]+)\s*筆資料", html_doc)
+    if not match:
+        # 寬鬆後備：處理壓縮或編碼差異導致的結構變異
+        match = re.search(r"共\s*([\d,]+)\s*筆", html_doc)
     if match:
-        return int(match.group(1).replace(",", ""))
+        try:
+            return int(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
     return None
 
 
@@ -599,10 +605,13 @@ def search_pcc(keyword: str, start_date: str, end_date: str, proctrg_cate: str =
     cancelled = should_stop if callable(should_stop) else (lambda: False)
 
     form = build_search_form(keyword, start_date, end_date, proctrg_cate, date_type)
+    emit(f"  [TIMING] 首頁請求開始...")
+    t0 = time.time()
     try:
         html_doc = http_post(BASIC_SEARCH_URL, form)
+        emit(f"  [TIMING] 首頁請求完成 耗時 {time.time()-t0:.1f}s")
     except Exception as e:
-        emit(f"  [!] 搜尋連線失敗 ({keyword}): {e}")
+        emit(f"  [!] 搜尋連線失敗 ({keyword}): {e} (耗時 {time.time()-t0:.1f}s)")
         return []
 
     if is_captcha_page(html_doc):
@@ -647,10 +656,13 @@ def search_pcc(keyword: str, start_date: str, end_date: str, proctrg_cate: str =
         time.sleep(polite_delay)
         paged_form = dict(form)
         paged_form[page_param] = str(page_idx)
+        emit(f"  [TIMING] 第 {page_idx}/{total_pages} 頁請求開始...")
+        t_page = time.time()
         try:
             page_html = http_post(BASIC_SEARCH_URL, paged_form)
+            emit(f"  [TIMING] 第 {page_idx} 頁完成 耗時 {time.time()-t_page:.1f}s")
         except Exception as e:
-            emit(f"    第 {page_idx} 頁抓取失敗: {e}")
+            emit(f"    第 {page_idx} 頁抓取失敗: {e} (耗時 {time.time()-t_page:.1f}s)")
             continue
         if is_captcha_page(page_html):
             emit(f"    第 {page_idx} 頁觸發驗證碼，停止翻頁（已取得 {len(results)} 筆）。")

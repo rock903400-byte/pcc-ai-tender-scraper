@@ -96,6 +96,7 @@ MAX_LOG_LINES = 1000
 LOG_KEEP = 500
 MAX_OUTPUT_KEEP = 20
 RATE_LIMIT_SECONDS = 60
+LOG_LOCK = threading.Lock()
 
 # 單一定義的欄位設定，三個分頁共用（延後初始化以符合 set_page_config 必須為首個 st 呼叫之規範，修復 Cloud healthz 8501 衝突）
 def get_tender_column_config():
@@ -342,9 +343,17 @@ def init_session_state():
 
 def append_log(message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.log_lines.append(f"[{timestamp}] {message}")
-    if len(st.session_state.log_lines) > MAX_LOG_LINES:
-        st.session_state.log_lines = st.session_state.log_lines[-LOG_KEEP:]
+    try:
+        with LOG_LOCK:
+            st.session_state.log_lines.append(f"[{timestamp}] {message}")
+            if len(st.session_state.log_lines) > MAX_LOG_LINES:
+                st.session_state.log_lines = st.session_state.log_lines[-LOG_KEEP:]
+    except Exception:
+        # 降級：若鎖或 session_state 異常，盡力寫入
+        try:
+            st.session_state.log_lines.append(f"[{timestamp}] {message}")
+        except Exception:
+            pass
 
 
 def clear_notices():
@@ -623,11 +632,18 @@ def run_search_thread(keywords: list, days: int, target_attr: str, target_award:
             targets = core.select_rows_for_enrichment(
                 tenders_list, target_attr, target_award,
                 require_keyword_hit=not include_misses)
+            # Cloud 環境保守：縮小單次校驗量避免 90s+ 阻塞導致前端超時跳掉（H5 完整加固）
+            is_cloud = os.getenv("STREAMLIT_SERVER_HEADLESS") == "1" or os.path.exists("/mount/src")
+            if is_cloud and len(targets) > 30:
+                qlog(f"  [Cloud] 候選 {len(targets)} 筆較多，為避免雲端超時，本次僅校驗前 30 筆，剩餘可手動按「立即補齊」。")
+                targets = targets[:30]
 
             def _on_progress(done, total):
-                if done % max(1, total // 50) == 0 or done == total:
-                    share = 100 - SEARCH_PROGRESS_SHARE
-                    qprogress(SEARCH_PROGRESS_SHARE + int(done / total * share))
+                # H5 修復：每筆皆更新進度，避免 70-100% 龜速假死；每 5 筆更新狀態文字
+                share = 100 - SEARCH_PROGRESS_SHARE
+                qprogress(SEARCH_PROGRESS_SHARE + int(done / total * share))
+                if done % 5 == 0 or done == total:
+                    qstatus("info", f"⚡ 校驗決標方式中… ({done}/{total} 筆候選)")
 
             if targets:
                 qlog(f"⚡ 從 {len(tenders_list)} 筆中挑出 {len(targets)} 筆尚未確認的候選，校驗真實決標方式（主來源：公開資料鏡像）...")
@@ -997,7 +1013,7 @@ with st.sidebar:
         st.session_state.trickle_queue = tq
         st.session_state.trickle_stop_event = tevt
         st.session_state.is_trickling = True
-        t = threading.Thread(target=run_trickle_thread, args=(tq, tevt), daemon=True)
+        t = threading.Thread(target=run_trickle_thread, args=(tq, tevt), daemon=False)
         t.start()
         st.session_state.trickle_thread = t
         append_log("🔄 已啟動補齊（背景執行，不阻塞頁面）…")
@@ -1011,13 +1027,15 @@ with st.sidebar:
         st.toast("已儲存搜尋條件", icon="✅")
 
 # ---------- 進度與警告列 ----------
-progress_placeholder = st.empty()
-status_placeholder = st.empty()
+# 進度條與狀態已移入 fragment 內部建立，避免跨 fragment 上下文導致 Cloud 靜默崩潰（H3 修復）
 notice_placeholder = st.empty()
 
 # ---------- 非阻塞：搜尋結果輪詢 ----------
 @st.fragment(run_every=0.8)
 def _search_polling_fragment():
+    # 內部建立進度元件，避免跨 fragment 上下文導致 Cloud 靜默崩潰（H3 修復）
+    _progress = st.empty()
+    _status = st.empty()
     if not st.session_state.is_running:
         return
     thread = ss_get("search_thread")
@@ -1026,31 +1044,46 @@ def _search_polling_fragment():
         st.session_state.is_running = False
         st.session_state.search_progress = 0
         return
-    progress_placeholder.progress(int(ss_get("search_progress", 0)))
+    try:
+        _progress.progress(int(ss_get("search_progress", 0)))
+    except Exception:
+        pass
     status = ss_get("search_status")
-    if status:
-        typ, msg = status if isinstance(status, tuple) else ("info", str(status))
-        if typ == "info":
-            status_placeholder.info(msg)
-        elif typ == "success":
-            status_placeholder.success(msg)
-        elif typ == "warning":
-            status_placeholder.warning(msg)
-        elif typ == "error":
-            status_placeholder.error(msg)
+    try:
+        if status:
+            typ, msg = status if isinstance(status, tuple) else ("info", str(status))
+            if typ == "info":
+                _status.info(msg)
+            elif typ == "success":
+                _status.success(msg)
+            elif typ == "warning":
+                _status.warning(msg)
+            elif typ == "error":
+                _status.error(msg)
+            else:
+                _status.info(msg)
         else:
-            status_placeholder.info(msg)
-    else:
-        status_placeholder.info("🔍 搜尋中… 請稍候，可按「停止搜尋」中斷")
+            _status.info("🔍 搜尋中… 請稍候，可按「停止搜尋」中斷")
+    except Exception:
+        pass
 
+    has_done = False
+    has_failed = False
     if q is not None:
         while not q.empty():
             try:
                 action, payload = q.get_nowait()
                 if action == "log":
-                    st.session_state.log_lines.append(payload)
-                    if len(st.session_state.log_lines) > MAX_LOG_LINES:
-                        st.session_state.log_lines = st.session_state.log_lines[-LOG_KEEP:]
+                    try:
+                        with LOG_LOCK:
+                            st.session_state.log_lines.append(payload)
+                            if len(st.session_state.log_lines) > MAX_LOG_LINES:
+                                st.session_state.log_lines = st.session_state.log_lines[-LOG_KEEP:]
+                    except Exception:
+                        try:
+                            st.session_state.log_lines.append(payload)
+                        except Exception:
+                            pass
                 elif action == "progress":
                     st.session_state.search_progress = int(payload)
                 elif action == "status":
@@ -1058,6 +1091,7 @@ def _search_polling_fragment():
                 elif action == "notice":
                     add_notice(payload)
                 elif action == "done":
+                    has_done = True
                     data = payload
                     st.session_state.tenders_all = data.get("tenders_all", [])
                     st.session_state.tenders_qualified = data.get("qualified", [])
@@ -1067,13 +1101,20 @@ def _search_polling_fragment():
                     if data.get("was_stopped"):
                         append_log("⏹ 搜尋已停止，顯示中斷前已取得的部分結果。")
                 elif action == "failed":
+                    has_failed = True
                     st.session_state.search_failed = payload
             except queue.Empty:
                 break
+            except Exception:
+                break
     thread = ss_get("search_thread")
     if thread is not None and not thread.is_alive():
-        if ss_get("search_failed"):
-            append_log(f"❌ 搜尋失敗已結束: {st.session_state.search_failed}")
+        if has_failed or ss_get("search_failed"):
+            append_log(f"❌ 搜尋失敗已結束: {ss_get('search_failed') or '未知錯誤'}")
+        elif not has_done:
+            # H2 修復：daemon 線程被容器回收或異常退出，未投遞 done，給出明確提示而非無聲跳掉
+            append_log("❌ 搜尋線程異常結束，未收到完成訊號，可能為雲端網路超時或容器回收，請縮小查詢範圍或關閉深度校驗重試。")
+            st.session_state.search_failed = "線程異常結束"
         st.session_state.is_running = False
         st.session_state.search_thread = None
         st.session_state.search_failed = None
@@ -1094,6 +1135,7 @@ if st.session_state.is_running:
 
 @st.fragment(run_every=0.9)
 def _trickle_polling_fragment():
+    _t_status = st.empty()
     if not st.session_state.is_trickling:
         return
     tq = ss_get("trickle_queue")
@@ -1102,9 +1144,16 @@ def _trickle_polling_fragment():
             try:
                 action, payload = tq.get_nowait()
                 if action == "log":
-                    st.session_state.log_lines.append(payload)
-                    if len(st.session_state.log_lines) > MAX_LOG_LINES:
-                        st.session_state.log_lines = st.session_state.log_lines[-LOG_KEEP:]
+                    try:
+                        with LOG_LOCK:
+                            st.session_state.log_lines.append(payload)
+                            if len(st.session_state.log_lines) > MAX_LOG_LINES:
+                                st.session_state.log_lines = st.session_state.log_lines[-LOG_KEEP:]
+                    except Exception:
+                        try:
+                            st.session_state.log_lines.append(payload)
+                        except Exception:
+                            pass
                 elif action == "trickle_result":
                     result = payload
                     if result.get("ok"):
@@ -1125,6 +1174,8 @@ def _trickle_polling_fragment():
                     append_log(f"  ⚠️ 補齊失敗: {payload}")
             except queue.Empty:
                 break
+            except Exception:
+                break
     t = ss_get("trickle_thread")
     if t is not None and not t.is_alive():
         st.session_state.is_trickling = False
@@ -1133,7 +1184,10 @@ def _trickle_polling_fragment():
     elif t is None:
         st.session_state.is_trickling = False
     else:
-        status_placeholder.info("🔄 補齊中…（約 1-2 分鐘，頁面可繼續操作）")
+        try:
+            _t_status.info("🔄 補齊中…（約 1-2 分鐘，頁面可繼續操作）")
+        except Exception:
+            pass
 
 
 if st.session_state.is_trickling:
@@ -1190,7 +1244,7 @@ if search_clicked and not st.session_state.is_running and not st.session_state.i
     thread = threading.Thread(
         target=run_search_thread,
         args=(keywords, days, target_attr, target_award, date_type, verify, include_misses, q, stop_event),
-        daemon=True,
+        daemon=False,
     )
     thread.start()
     st.session_state.search_thread = thread
