@@ -546,6 +546,16 @@ def rows_fingerprint(rows: list) -> str:
     return h.hexdigest()
 
 
+def tender_key(t: dict) -> str:
+    """取得標案的穩定識別鍵，優先使用 pk，退回標案案號。"""
+    return t.get("pk") or t.get("標案案號") or ""
+
+
+def tender_label(t: dict) -> str:
+    """產生標案在下拉選單中的顯示文字。"""
+    return f"{t.get('招標機關','')} - {t.get('標案名稱','')} ({t.get('標案案號','')})"
+
+
 @st.cache_data(show_spinner=False)
 def cached_excel_bytes(fingerprint: str, _all_tenders: list, _matched_tenders: list) -> bytes:
     return build_excel_bytes(_all_tenders, _matched_tenders)
@@ -1431,27 +1441,27 @@ with tab_matched:
         if filtered:
             with st.expander("⭐ 標案收藏與追蹤操作", expanded=False):
                 col_bm1, col_bm2 = st.columns([4, 1])
-                tender_options = {
-                    f"{t.get('招標機關','')} - {t.get('標案名稱','')} ({t.get('標案案號','')})": t
-                    for t in filtered
-                }
+                option_map = {tender_key(t): t for t in filtered if tender_key(t)}
+                missing_count = len(filtered) - len(option_map)
                 with col_bm1:
-                    selected_to_bm = st.multiselect(
+                    selected_ids = st.multiselect(
                         "選取要加入追蹤的標案：",
-                        options=list(tender_options.keys()),
+                        options=list(option_map.keys()),
+                        format_func=lambda k: tender_label(option_map[k]),
                         placeholder="請選擇一筆或多筆標案…",
                         key="bm_select_matched",
                     )
+                    if missing_count > 0:
+                        st.caption(f"有 {missing_count} 筆標案缺少案號，無法加入追蹤")
                 with col_bm2:
                     st.write("")
                     if st.button("➕ 加入追蹤", width="stretch", key="btn_add_bm_matched"):
-                        if selected_to_bm:
+                        if selected_ids:
                             wl = st.session_state.watchlist
                             added_count = 0
-                            for item_name in selected_to_bm:
-                                tender_obj = tender_options[item_name]
-                                key_id = tender_obj.get("pk") or tender_obj.get("標案案號")
-                                if key_id and key_id not in wl:
+                            for key_id in selected_ids:
+                                tender_obj = option_map[key_id]
+                                if key_id not in wl:
                                     wl[key_id] = tender_obj
                                     added_count += 1
                             st.session_state.watchlist = wl
@@ -1569,27 +1579,27 @@ with tab_all:
         if filtered_all:
             with st.expander("⭐ 標案收藏與追蹤操作", expanded=False):
                 col_bm1_a, col_bm2_a = st.columns([4, 1])
-                tender_options_all = {
-                    f"{t.get('招標機關','')} - {t.get('標案名稱','')} ({t.get('標案案號','')})": t
-                    for t in filtered_all
-                }
+                option_map_all = {tender_key(t): t for t in filtered_all if tender_key(t)}
+                missing_count_all = len(filtered_all) - len(option_map_all)
                 with col_bm1_a:
-                    selected_to_bm_all = st.multiselect(
+                    selected_ids_all = st.multiselect(
                         "選取要加入追蹤的標案：",
-                        options=list(tender_options_all.keys()),
+                        options=list(option_map_all.keys()),
+                        format_func=lambda k: tender_label(option_map_all[k]),
                         placeholder="請選擇一筆或多筆標案…",
                         key="bm_select_all",
                     )
+                    if missing_count_all > 0:
+                        st.caption(f"有 {missing_count_all} 筆標案缺少案號，無法加入追蹤")
                 with col_bm2_a:
                     st.write("")
                     if st.button("➕ 加入追蹤", width="stretch", key="btn_add_bm_all"):
-                        if selected_to_bm_all:
+                        if selected_ids_all:
                             wl = st.session_state.watchlist
                             added_count = 0
-                            for item_name in selected_to_bm_all:
-                                tender_obj = tender_options_all[item_name]
-                                key_id = tender_obj.get("pk") or tender_obj.get("標案案號")
-                                if key_id and key_id not in wl:
+                            for key_id in selected_ids_all:
+                                tender_obj = option_map_all[key_id]
+                                if key_id not in wl:
                                     wl[key_id] = tender_obj
                                     added_count += 1
                             st.session_state.watchlist = wl
@@ -1661,16 +1671,16 @@ with tab_watchlist:
 
         col_wl_act1, col_wl_act2, col_wl_act3 = st.columns([2, 1, 1])
         with col_wl_act1:
-            wl_remove_options = {
-                f"{t.get('招標機關','')} - {t.get('標案名稱','')} ({t.get('標案案號','')})": k
-                for k, t in st.session_state.watchlist.items()
-            }
-            to_remove = st.multiselect("選取要移出追蹤的標案：", options=list(wl_remove_options.keys()), key="wl_remove_sel")
+            to_remove = st.multiselect(
+                "選取要移出追蹤的標案：",
+                options=list(st.session_state.watchlist.keys()),
+                format_func=lambda k: tender_label(st.session_state.watchlist[k].get("snapshot", st.session_state.watchlist[k]) if isinstance(st.session_state.watchlist[k], dict) and "snapshot" in st.session_state.watchlist[k] else st.session_state.watchlist[k]),
+                key="wl_remove_sel",
+            )
             if st.button("🗑️ 移出選取標案", key="btn_remove_wl_items"):
                 if to_remove:
                     wl = st.session_state.watchlist
-                    for item in to_remove:
-                        k = wl_remove_options.get(item)
+                    for k in to_remove:
                         if k in wl:
                             del wl[k]
                     st.session_state.watchlist = wl
