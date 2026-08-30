@@ -108,7 +108,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-瀏覽器會自動開啟 `http://localhost:8502`（見 `.streamlit/config.toml`；若被占用可用 `streamlit run app.py --server.port 8503`），在側邊欄設定條件後按「開始搜尋標案」即可。
+瀏覽器會自動開啟 `http://localhost:8501`（Streamlit 預設；本地若需指定可用 `streamlit run app.py --server.port 8502`），在側邊欄設定條件後按「開始搜尋標案」即可。
 表格支援點擊欄頭排序（預算請點「預算數值」欄以數值排序）、快速篩選，`詳細連結` 欄可直達官方頁面；匯出按鈕提供 Excel / CSV 下載。搜尋期間頁面保持可操作，可隨時按「停止搜尋」中斷。
 
 ---

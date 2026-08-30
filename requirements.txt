@@ -1,10 +1,11 @@
-# 執行期相依套件
+# 執行期相依套件（已 pin 精準版以確保 Streamlit Cloud 建置穩定，避免 Python 3.14 浮動解析）
 # 網路連線與 HTML 解析僅使用 Python 標準函式庫，無需額外套件。
 
 # 資料處理與 Excel 報表匯出
-pandas>=2.0.0
-openpyxl>=3.1.0
+pandas==3.0.5
+openpyxl==3.1.5
+pyarrow==24.0.0
 
-# Web 操作介面
-streamlit>=1.49.0
-altair>=5.0.0
+# Web 操作介面（altair 6 需 streamlit>=1.52 才能在 Python 3.14 正常運作）
+streamlit==1.62.0
+altair==6.2.2

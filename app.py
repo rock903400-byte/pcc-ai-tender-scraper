@@ -97,21 +97,27 @@ LOG_KEEP = 500
 MAX_OUTPUT_KEEP = 20
 RATE_LIMIT_SECONDS = 60
 
-# 單一定義的欄位設定，三個分頁共用（C1 重構，C2 新增剩餘天數）
-TENDER_COLUMN_CONFIG = {
-    "#": st.column_config.NumberColumn("#", width="small"),
-    "公告日期": st.column_config.TextColumn("公告日期", width="small"),
-    "招標機關": st.column_config.TextColumn("招標機關", width="medium"),
-    "標案名稱": st.column_config.TextColumn("標案名稱", width="large"),
-    "預算金額": st.column_config.NumberColumn("預算金額", width="small", help="點擊此欄可按金額正確排序（數值排序）", format="%d 元"),
-    "決標方式": st.column_config.TextColumn("決標方式", width="medium", help="🟠=推估待確認，⚪=已確認但不符目前決標篩選"),
-    "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
-    "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
-    "截止投標": st.column_config.TextColumn("截止投標", width="small"),
-    "剩餘天數": st.column_config.TextColumn("剩餘天數", width="small", help="🔥≤3天 ⏳4-7天 📅8-14天 🗓️>14天 已截標/— 為特殊狀態；排序請用「截止投標」欄"),
-    "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
-    "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small", help="點擊開啟官方公告頁面"),
-}
+# 單一定義的欄位設定，三個分頁共用（延後初始化以符合 set_page_config 必須為首個 st 呼叫之規範，修復 Cloud healthz 8501 衝突）
+def get_tender_column_config():
+    """回傳表格欄位設定，需在 st.set_page_config 之後呼叫。"""
+    return {
+        "#": st.column_config.NumberColumn("#", width="small"),
+        "公告日期": st.column_config.TextColumn("公告日期", width="small"),
+        "招標機關": st.column_config.TextColumn("招標機關", width="medium"),
+        "標案名稱": st.column_config.TextColumn("標案名稱", width="large"),
+        "預算金額": st.column_config.NumberColumn("預算金額", width="small", help="點擊此欄可按金額正確排序（數值排序）", format="%d 元"),
+        "決標方式": st.column_config.TextColumn("決標方式", width="medium", help="🟠=推估待確認，⚪=已確認但不符目前決標篩選"),
+        "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
+        "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
+        "截止投標": st.column_config.TextColumn("截止投標", width="small"),
+        "剩餘天數": st.column_config.TextColumn("剩餘天數", width="small", help="🔥≤3天 ⏳4-7天 📅8-14天 🗓️>14天 已截標/— 為特殊狀態；排序請用「截止投標」欄"),
+        "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
+        "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small", help="點擊開啟官方公告頁面"),
+    }
+
+
+# 相容舊引用：實際值在 set_page_config 後初始化（避免在 import 時期即呼叫 st.column_config）
+TENDER_COLUMN_CONFIG = None
 
 
 def table_height(row_count: int, max_rows: int = 18, cap: int = 580) -> int:
@@ -831,6 +837,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# 延後初始化欄位設定（必須在 set_page_config 之後，否則 Cloud 會因 st.* 順序違規導致 healthz 失敗）
+TENDER_COLUMN_CONFIG = get_tender_column_config()
 
 init_session_state()
 
