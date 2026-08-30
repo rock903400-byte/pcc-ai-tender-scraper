@@ -111,6 +111,106 @@ KEYWORDS_MAX_CHARS = 500
 KEYWORDS_MAX_WORDS = 100
 KEYWORDS_MAX_WORD_LEN = 30
 
+# 單一定義的欄位設定，三個分頁共用（C1 重構）
+TENDER_COLUMN_CONFIG = {
+    "#": st.column_config.NumberColumn("#", width="small"),
+    "公告日期": st.column_config.TextColumn("公告日期", width="small"),
+    "招標機關": st.column_config.TextColumn("招標機關", width="medium"),
+    "標案名稱": st.column_config.TextColumn("標案名稱", width="large"),
+    "預算金額": st.column_config.NumberColumn("預算金額", width="small", help="點擊此欄可按金額正確排序（數值排序）", format="%d 元"),
+    "決標方式": st.column_config.TextColumn("決標方式", width="medium", help="🟠=推估待確認，⚪=已確認但不符目前決標篩選"),
+    "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
+    "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
+    "截止投標": st.column_config.TextColumn("截止投標", width="small"),
+    "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
+    "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small", help="點擊開啟官方公告頁面"),
+}
+
+
+def table_height(row_count: int, max_rows: int = 18, cap: int = 580) -> int:
+    """依列數計算表格高度，避免重複的魔術數字。"""
+    return min(cap, 80 + 35 * min(row_count, max_rows))
+
+
+def render_filter_panel(key_prefix: str) -> dict:
+    """渲染快速搜尋與進階篩選器，回傳過濾參數 dict。"""
+    col_q, col_exp = st.columns([3, 1])
+    with col_q:
+        q = st.text_input("🔍 快速搜尋（機關 / 案名 / 案號 / 關鍵字）", key=f"filter_{key_prefix}", placeholder="輸入關鍵字即時過濾…")
+    with col_exp:
+        st.write("")
+        st.caption("👇 可展開下方進行預算、急迫度多維度篩選")
+    with st.expander("🎛️ 進階條件篩選器 (預算金額 / 截標急迫度 / 決標狀態)", expanded=False):
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            budget_range = st.slider(
+                "預算金額範圍 (萬元)",
+                min_value=0,
+                max_value=2000,
+                value=(0, 2000),
+                step=50,
+                key=f"budget_slider_{key_prefix}",
+                help="設為 0 代表不設下限/上限；超過 2,000 萬的標案在上限為 2,000 時仍會納入",
+            )
+        with fc2:
+            urgency_sel = st.selectbox("截止投標急迫度", options=URGENCY_OPTIONS, key=f"urgency_sel_{key_prefix}")
+        with fc3:
+            award_status_sel = st.selectbox("決標校驗狀態", options=AWARD_STATUS_FILTER_OPTIONS, key=f"award_sel_{key_prefix}")
+    min_b = budget_range[0] if budget_range[0] > 0 else 0
+    max_b = budget_range[1] if budget_range[1] < 2000 else 0
+    return {"query": q, "min_budget_wan": min_b, "max_budget_wan": max_b, "urgency": urgency_sel, "award_status": award_status_sel}
+
+
+def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int = 18, cap: int = 580) -> None:
+    """渲染標案表格（共用欄位設定與高度計算）。"""
+    if not rows:
+        return
+    df = tenders_to_dataframe(rows, st.session_state.active_award_target)
+    display_df = df[DISPLAY_COLUMNS] if set(DISPLAY_COLUMNS).issubset(df.columns) else df
+    st.dataframe(
+        display_df,
+        width="stretch",
+        hide_index=True,
+        height=table_height(len(display_df), max_rows, cap),
+        column_config=TENDER_COLUMN_CONFIG,
+    )
+    st.caption(caption)
+
+
+def render_watchlist_actions(rows: list, key_prefix: str) -> None:
+    """渲染收藏操作區（使用穩定 ID 與 format_func，避免顯示字串碰撞）。"""
+    if not rows:
+        return
+    with st.expander("⭐ 標案收藏與追蹤操作", expanded=False):
+        col_bm1, col_bm2 = st.columns([4, 1])
+        option_map = {tender_key(t): t for t in rows if tender_key(t)}
+        missing_count = len(rows) - len(option_map)
+        with col_bm1:
+            selected_ids = st.multiselect(
+                "選取要加入追蹤的標案：",
+                options=list(option_map.keys()),
+                format_func=lambda k: tender_label(option_map[k]),
+                placeholder="請選擇一筆或多筆標案…",
+                key=f"bm_select_{key_prefix}",
+            )
+            if missing_count > 0:
+                st.caption(f"有 {missing_count} 筆標案缺少案號，無法加入追蹤")
+        with col_bm2:
+            st.write("")
+            if st.button("➕ 加入追蹤", width="stretch", key=f"btn_add_bm_{key_prefix}"):
+                if selected_ids:
+                    wl = st.session_state.watchlist
+                    added_count = 0
+                    for key_id in selected_ids:
+                        tender_obj = option_map[key_id]
+                        if key_id not in wl:
+                            wl[key_id] = tender_obj
+                            added_count += 1
+                    st.session_state.watchlist = wl
+                    save_watchlist(wl)
+                    st.toast(f"已加入 {added_count} 筆標案至追蹤清單！", icon="⭐")
+                    st.rerun()
+
 
 # ==================== 檔案路徑與狀態 ====================
 
@@ -1097,101 +1197,23 @@ with tab_matched:
     else:
         base_rows = _qualified if st.session_state.include_misses else _keyword_hits
 
-        col_q, col_exp = st.columns([3, 1])
-        with col_q:
-            q = st.text_input("🔍 快速搜尋（機關 / 案名 / 案號 / 關鍵字）", key="filter_matched", placeholder="輸入關鍵字即時過濾…")
-        with col_exp:
-            st.write("")
-            st.caption("👇 可展開下方進行預算、急迫度多維度篩選")
-
-        # 進階過濾面板
-        with st.expander("🎛️ 進階條件篩選器 (預算金額 / 截標急迫度 / 決標狀態)", expanded=False):
-            fc1, fc2, fc3 = st.columns(3)
-            with fc1:
-                budget_range = st.slider(
-                    "預算金額範圍 (萬元)",
-                    min_value=0,
-                    max_value=2000,
-                    value=(0, 2000),
-                    step=50,
-                    key="budget_slider_matched",
-                    help="設為 0 代表不設下限/上限；超過 2,000 萬的標案在上限為 2,000 時仍會納入",
-                )
-            with fc2:
-                urgency_sel = st.selectbox("截止投標急迫度", options=URGENCY_OPTIONS, key="urgency_sel_matched")
-            with fc3:
-                award_status_sel = st.selectbox("決標校驗狀態", options=AWARD_STATUS_FILTER_OPTIONS, key="award_sel_matched")
-
-        min_b = budget_range[0] if budget_range[0] > 0 else 0
-        max_b = budget_range[1] if budget_range[1] < 2000 else 0
-
+        filt = render_filter_panel("matched")
         filtered = build_advanced_display_rows(
             base_rows,
             hide_pending_filter=st.session_state.hide_pending,
-            query=q,
-            min_budget_wan=min_b,
-            max_budget_wan=max_b,
-            urgency=urgency_sel,
-            award_status=award_status_sel,
+            query=filt["query"],
+            min_budget_wan=filt["min_budget_wan"],
+            max_budget_wan=filt["max_budget_wan"],
+            urgency=filt["urgency"],
+            award_status=filt["award_status"],
         )
 
         if not filtered:
             st.warning("無符合篩選條件的精選標案。請調整搜尋關鍵字或放寬進階篩選條件。")
         else:
-            df = tenders_to_dataframe(filtered, st.session_state.active_award_target)
-            display_df = df[DISPLAY_COLUMNS] if set(DISPLAY_COLUMNS).issubset(df.columns) else df
-            st.dataframe(
-                display_df,
-                width="stretch",
-                hide_index=True,
-                height=min(580, 80 + 35 * min(len(display_df), 18)),
-                column_config={
-                    "#": st.column_config.NumberColumn("#", width="small"),
-                    "公告日期": st.column_config.TextColumn("公告日期", width="small"),
-                    "招標機關": st.column_config.TextColumn("招標機關", width="medium"),
-                    "標案名稱": st.column_config.TextColumn("標案名稱", width="large"),
-                    "預算金額": st.column_config.NumberColumn("預算金額", width="small", help="點擊此欄可按金額正確排序（數值排序）", format="%d 元"),
-                    "決標方式": st.column_config.TextColumn("決標方式", width="medium", help="🟠=推估待確認，⚪=已確認但不符目前決標篩選"),
-                    "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
-                    "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
-                    "截止投標": st.column_config.TextColumn("截止投標", width="small"),
-                    "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
-                    "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small", help="點擊開啟官方公告頁面"),
-                },
-            )
-            st.caption(f"顯示 {len(filtered)} / {len(base_rows)} 筆（原始符合條件 {len(_qualified)} 筆） · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符")
+            render_tender_table(filtered, "matched", f"顯示 {len(filtered)} / {len(base_rows)} 筆（原始符合條件 {len(_qualified)} 筆） · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符")
 
-        # 快速收藏操作區
-        if filtered:
-            with st.expander("⭐ 標案收藏與追蹤操作", expanded=False):
-                col_bm1, col_bm2 = st.columns([4, 1])
-                option_map = {tender_key(t): t for t in filtered if tender_key(t)}
-                missing_count = len(filtered) - len(option_map)
-                with col_bm1:
-                    selected_ids = st.multiselect(
-                        "選取要加入追蹤的標案：",
-                        options=list(option_map.keys()),
-                        format_func=lambda k: tender_label(option_map[k]),
-                        placeholder="請選擇一筆或多筆標案…",
-                        key="bm_select_matched",
-                    )
-                    if missing_count > 0:
-                        st.caption(f"有 {missing_count} 筆標案缺少案號，無法加入追蹤")
-                with col_bm2:
-                    st.write("")
-                    if st.button("➕ 加入追蹤", width="stretch", key="btn_add_bm_matched"):
-                        if selected_ids:
-                            wl = st.session_state.watchlist
-                            added_count = 0
-                            for key_id in selected_ids:
-                                tender_obj = option_map[key_id]
-                                if key_id not in wl:
-                                    wl[key_id] = tender_obj
-                                    added_count += 1
-                            st.session_state.watchlist = wl
-                            save_watchlist(wl)
-                            st.toast(f"已加入 {added_count} 筆標案至追蹤清單！", icon="⭐")
-                            st.rerun()
+        render_watchlist_actions(filtered, "matched")
 
         st.divider()
         st.markdown("**匯出**")
@@ -1238,98 +1260,23 @@ with tab_all:
             unsafe_allow_html=True,
         )
     else:
-        col_q2, col_exp2 = st.columns([3, 1])
-        with col_q2:
-            q2 = st.text_input("🔍 快速搜尋（機關 / 案名 / 案號 / 關鍵字）", key="filter_all", placeholder="輸入關鍵字即時過濾…")
-        with col_exp2:
-            st.write("")
-            st.caption("👇 可展開下方進行進階篩選")
-
-        with st.expander("🎛️ 進階條件篩選器 (預算金額 / 截標急迫度 / 決標狀態)", expanded=False):
-            fc1_a, fc2_a, fc3_a = st.columns(3)
-            with fc1_a:
-                budget_range_all = st.slider(
-                    "預算金額範圍 (萬元)",
-                    min_value=0,
-                    max_value=2000,
-                    value=(0, 2000),
-                    step=50,
-                    key="budget_slider_all",
-                )
-            with fc2_a:
-                urgency_all_sel = st.selectbox("截止投標急迫度", options=URGENCY_OPTIONS, key="urgency_sel_all")
-            with fc3_a:
-                award_status_all_sel = st.selectbox("決標校驗狀態", options=AWARD_STATUS_FILTER_OPTIONS, key="award_sel_all")
-
-        min_b_all = budget_range_all[0] if budget_range_all[0] > 0 else 0
-        max_b_all = budget_range_all[1] if budget_range_all[1] < 2000 else 0
-
+        filt_all = render_filter_panel("all")
         filtered_all = build_advanced_display_rows(
             st.session_state.tenders_all,
             hide_pending_filter=False,
-            query=q2,
-            min_budget_wan=min_b_all,
-            max_budget_wan=max_b_all,
-            urgency=urgency_all_sel,
-            award_status=award_status_all_sel,
+            query=filt_all["query"],
+            min_budget_wan=filt_all["min_budget_wan"],
+            max_budget_wan=filt_all["max_budget_wan"],
+            urgency=filt_all["urgency"],
+            award_status=filt_all["award_status"],
         )
 
         if not filtered_all:
             st.warning("無符合篩選條件的標案。")
         else:
-            df_all = tenders_to_dataframe(filtered_all, st.session_state.active_award_target)
-            display_all = df_all[DISPLAY_COLUMNS] if set(DISPLAY_COLUMNS).issubset(df_all.columns) else df_all
-            st.dataframe(
-                display_all,
-                width="stretch",
-                hide_index=True,
-                height=min(580, 80 + 35 * min(len(display_all), 18)),
-                column_config={
-                    "#": st.column_config.NumberColumn("#", width="small"),
-                    "公告日期": st.column_config.TextColumn("公告日期", width="small"),
-                    "招標機關": st.column_config.TextColumn("招標機關", width="medium"),
-                    "標案名稱": st.column_config.TextColumn("標案名稱", width="large"),
-                    "預算金額": st.column_config.NumberColumn("預算金額", width="small", help="點擊此欄可按金額正確排序（數值排序）", format="%d 元"),
-                    "決標方式": st.column_config.TextColumn("決標方式", width="medium"),
-                    "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
-                    "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
-                    "截止投標": st.column_config.TextColumn("截止投標", width="small"),
-                    "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
-                    "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small"),
-                },
-            )
-            st.caption(f"顯示 {len(filtered_all)} / {len(st.session_state.tenders_all)} 筆 · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面")
+            render_tender_table(filtered_all, "all", f"顯示 {len(filtered_all)} / {len(st.session_state.tenders_all)} 筆 · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面")
 
-        if filtered_all:
-            with st.expander("⭐ 標案收藏與追蹤操作", expanded=False):
-                col_bm1_a, col_bm2_a = st.columns([4, 1])
-                option_map_all = {tender_key(t): t for t in filtered_all if tender_key(t)}
-                missing_count_all = len(filtered_all) - len(option_map_all)
-                with col_bm1_a:
-                    selected_ids_all = st.multiselect(
-                        "選取要加入追蹤的標案：",
-                        options=list(option_map_all.keys()),
-                        format_func=lambda k: tender_label(option_map_all[k]),
-                        placeholder="請選擇一筆或多筆標案…",
-                        key="bm_select_all",
-                    )
-                    if missing_count_all > 0:
-                        st.caption(f"有 {missing_count_all} 筆標案缺少案號，無法加入追蹤")
-                with col_bm2_a:
-                    st.write("")
-                    if st.button("➕ 加入追蹤", width="stretch", key="btn_add_bm_all"):
-                        if selected_ids_all:
-                            wl = st.session_state.watchlist
-                            added_count = 0
-                            for key_id in selected_ids_all:
-                                tender_obj = option_map_all[key_id]
-                                if key_id not in wl:
-                                    wl[key_id] = tender_obj
-                                    added_count += 1
-                            st.session_state.watchlist = wl
-                            save_watchlist(wl)
-                            st.toast(f"已加入 {added_count} 筆標案至追蹤清單！", icon="⭐")
-                            st.rerun()
+        render_watchlist_actions(filtered_all, "all")
 
         st.divider()
         if st.session_state.tenders_all:
@@ -1370,28 +1317,7 @@ with tab_watchlist:
             unsafe_allow_html=True,
         )
     else:
-        st.caption(f"📌 共收藏 {len(watchlist_items)} 筆標案 · 資料永久保存於 `output/watchlist.json`")
-        df_wl = tenders_to_dataframe(watchlist_items, st.session_state.active_award_target)
-        display_wl = df_wl[DISPLAY_COLUMNS] if set(DISPLAY_COLUMNS).issubset(df_wl.columns) else df_wl
-        st.dataframe(
-            display_wl,
-            width="stretch",
-            hide_index=True,
-            height=min(500, 80 + 35 * min(len(display_wl), 15)),
-            column_config={
-                "#": st.column_config.NumberColumn("#", width="small"),
-                "公告日期": st.column_config.TextColumn("公告日期", width="small"),
-                "招標機關": st.column_config.TextColumn("招標機關", width="medium"),
-                "標案名稱": st.column_config.TextColumn("標案名稱", width="large"),
-                "預算金額": st.column_config.NumberColumn("預算金額", width="small", format="%d 元"),
-                "決標方式": st.column_config.TextColumn("決標方式", width="medium"),
-                "招標方式": st.column_config.TextColumn("招標方式", width="medium"),
-                "決標方式來源": st.column_config.TextColumn("決標依據", width="small"),
-                "截止投標": st.column_config.TextColumn("截止投標", width="small"),
-                "命中關鍵字": st.column_config.TextColumn("命中關鍵字", width="small"),
-                "詳細連結": st.column_config.LinkColumn("詳細連結", display_text="🔗 開啟", width="small"),
-            },
-        )
+        render_tender_table(watchlist_items, "watchlist", f"📌 共收藏 {len(watchlist_items)} 筆標案 · 資料永久保存於 `output/watchlist.json`", max_rows=15, cap=500)
 
         col_wl_act1, col_wl_act2, col_wl_act3 = st.columns([2, 1, 1])
         with col_wl_act1:
