@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-建置與效能優化發布腳本 (build_release.py)
-一鍵生成：
-1. 秒開綠色版 (Onedir) - < 1 秒極速啟動
-2. 極速瘦身單檔版 (Onefile) - 精準排除冗餘大型套件 (scipy, pyarrow, numba 等)
+建置腳本（歷史遺留：桌面 ttkbootstrap 版）
+
+本專案已改為 Streamlit Web 版（`streamlit run app.py`），不再需要 PyInstaller 打包。
+此檔案僅為相容保留，若仍需打包 Streamlit 請改用 `pip install streamlit` 直接執行，
+或自行以 `pyinstaller --collect-all streamlit` 重寫。
 """
 
 import os
@@ -60,13 +61,15 @@ def build_onedir():
         except Exception:
             pass
 
+    print("[SKIP] 本專案已為 Streamlit 版，無需 ttkbootstrap 打包。請直接 `streamlit run app.py`。")
+    return
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "-y",
         "--noconsole",
         "--onedir",
         "--name", name,
-        "--collect-all", "ttkbootstrap",
+        "--collect-all", "streamlit",
     ] + get_exclude_flags() + ["app.py"]
     
     start_t = time.time()
@@ -85,13 +88,15 @@ def build_onefile():
     print("[2/2] 正在建置：【極速瘦身單檔版 (--onefile)】...")
     print("=" * 60)
     name = "政府採購網標案爬蟲"
+    print("[SKIP] 本專案已為 Streamlit 版，無需 ttkbootstrap 打包。請直接 `streamlit run app.py`。")
+    return
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "-y",
         "--noconsole",
         "--onefile",
         "--name", name,
-        "--collect-all", "ttkbootstrap",
+        "--collect-all", "streamlit",
     ] + get_exclude_flags() + ["app.py"]
     
     start_t = time.time()
