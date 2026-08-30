@@ -163,56 +163,69 @@ def render_filter_panel(key_prefix: str) -> dict:
     return {"query": q, "min_budget_wan": min_b, "max_budget_wan": max_b, "urgency": urgency_sel, "award_status": award_status_sel}
 
 
-def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int = 18, cap: int = 580) -> None:
-    """渲染標案表格（共用欄位設定與高度計算）。"""
+def render_tender_table(rows: list, key_prefix: str, caption: str, max_rows: int = 18, cap: int = 580, selectable: bool = False) -> None:
+    """渲染標案表格（共用欄位設定與高度計算）。支援可選取模式（C3）。"""
     if not rows:
         return
     df = tenders_to_dataframe(rows, st.session_state.active_award_target)
     display_df = df[DISPLAY_COLUMNS] if set(DISPLAY_COLUMNS).issubset(df.columns) else df
-    st.dataframe(
-        display_df,
-        width="stretch",
-        hide_index=True,
-        height=table_height(len(display_df), max_rows, cap),
-        column_config=TENDER_COLUMN_CONFIG,
-    )
-    # 剩餘天數為文字（emoji）排序不準，提示使用者用截止投標欄排序（C2 選 caption 方案）
-    st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄")
+    if selectable:
+        # 可選取模式：表格本身支援多列選取，移除原本的下拉選單
+        event = st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True,
+            height=table_height(len(display_df), max_rows, cap),
+            column_config=TENDER_COLUMN_CONFIG,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key=f"table_{key_prefix}",
+        )
+        st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄 · 勾選列後按下方按鈕加入追蹤")
+        # 顯示缺少案號提示（不可選）
+        missing = sum(1 for r in rows if not tender_key(r))
+        if missing > 0:
+            st.caption(f"有 {missing} 筆標案缺少案號，無法加入追蹤")
+        # 取得選取列（位置索引對應傳入的 rows 順序）
+        try:
+            selected_idx = event.selection.rows if hasattr(event, "selection") and event.selection is not None else []
+        except Exception:
+            selected_idx = []
+        if selected_idx is None:
+            selected_idx = []
+        selected_count = len(selected_idx)
+        # 按鈕顯示已選筆數
+        btn_label = f"➕ 加入追蹤（已選 {selected_count} 筆）" if selected_count else "➕ 加入追蹤（請先勾選）"
+        if st.button(btn_label, width="stretch", key=f"btn_add_bm_{key_prefix}", disabled=(selected_count == 0)):
+            if selected_idx:
+                wl = st.session_state.watchlist
+                added_count = 0
+                for i in selected_idx:
+                    if 0 <= i < len(rows):
+                        t = rows[i]
+                        key_id = tender_key(t)
+                        if key_id and key_id not in wl:
+                            wl[key_id] = t
+                            added_count += 1
+                st.session_state.watchlist = wl
+                save_watchlist(wl)
+                st.toast(f"已加入 {added_count} 筆標案至追蹤清單！", icon="⭐")
+                st.rerun()
+    else:
+        st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True,
+            height=table_height(len(display_df), max_rows, cap),
+            column_config=TENDER_COLUMN_CONFIG,
+        )
+        st.caption(caption + " · 剩餘天數為文字顯示，排序請用「截止投標」欄")
 
 
 def render_watchlist_actions(rows: list, key_prefix: str) -> None:
-    """渲染收藏操作區（使用穩定 ID 與 format_func，避免顯示字串碰撞）。"""
-    if not rows:
-        return
-    with st.expander("⭐ 標案收藏與追蹤操作", expanded=False):
-        col_bm1, col_bm2 = st.columns([4, 1])
-        option_map = {tender_key(t): t for t in rows if tender_key(t)}
-        missing_count = len(rows) - len(option_map)
-        with col_bm1:
-            selected_ids = st.multiselect(
-                "選取要加入追蹤的標案：",
-                options=list(option_map.keys()),
-                format_func=lambda k: tender_label(option_map[k]),
-                placeholder="請選擇一筆或多筆標案…",
-                key=f"bm_select_{key_prefix}",
-            )
-            if missing_count > 0:
-                st.caption(f"有 {missing_count} 筆標案缺少案號，無法加入追蹤")
-        with col_bm2:
-            st.write("")
-            if st.button("➕ 加入追蹤", width="stretch", key=f"btn_add_bm_{key_prefix}"):
-                if selected_ids:
-                    wl = st.session_state.watchlist
-                    added_count = 0
-                    for key_id in selected_ids:
-                        tender_obj = option_map[key_id]
-                        if key_id not in wl:
-                            wl[key_id] = tender_obj
-                            added_count += 1
-                    st.session_state.watchlist = wl
-                    save_watchlist(wl)
-                    st.toast(f"已加入 {added_count} 筆標案至追蹤清單！", icon="⭐")
-                    st.rerun()
+    """(已棄用，C3 改為表格直接選取) 保留以免舊呼叫崩潰，實際不再使用。"""
+    # C3 後收藏改為表格 on_select，此函式僅為相容性保留，不再渲染
+    return
 
 
 # ==================== 檔案路徑與狀態 ====================
@@ -1214,9 +1227,11 @@ with tab_matched:
         if not filtered:
             st.warning("無符合篩選條件的精選標案。請調整搜尋關鍵字或放寬進階篩選條件。")
         else:
-            render_tender_table(filtered, "matched", f"顯示 {len(filtered)} / {len(base_rows)} 筆（原始符合條件 {len(_qualified)} 筆） · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符")
+            render_tender_table(filtered, "matched", f"顯示 {len(filtered)} / {len(base_rows)} 筆（原始符合條件 {len(_qualified)} 筆） · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面 · 🟠=推估待確認，⚪=已確認但不符", selectable=True)
 
-        render_watchlist_actions(filtered, "matched")
+        # C3 後不再使用下拉，改為表格選取（render_tender_table 內已含按鈕）
+        # 保留空呼叫以相容
+        # render_watchlist_actions(filtered, "matched")
 
         st.divider()
         st.markdown("**匯出**")
@@ -1277,9 +1292,7 @@ with tab_all:
         if not filtered_all:
             st.warning("無符合篩選條件的標案。")
         else:
-            render_tender_table(filtered_all, "all", f"顯示 {len(filtered_all)} / {len(st.session_state.tenders_all)} 筆 · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面")
-
-        render_watchlist_actions(filtered_all, "all")
+            render_tender_table(filtered_all, "all", f"顯示 {len(filtered_all)} / {len(st.session_state.tenders_all)} 筆 · 點擊欄頭排序（含預算數值排序） · 點擊「詳細連結」開啟官方頁面", selectable=True)
 
         st.divider()
         if st.session_state.tenders_all:
