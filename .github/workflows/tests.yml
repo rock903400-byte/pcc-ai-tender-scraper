@@ -27,5 +27,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: Check UI isolation
+        run: |
+          if grep -qi "streamlit" ui_logic.py; then echo "ui_logic.py 不得依賴 streamlit"; exit 1; fi
+          if grep -q "st\.session_state" ui_logic.py; then echo "ui_logic.py 不得使用 st.session_state"; exit 1; fi
+
       - name: Run tests
         run: python -m pytest tests/ -v

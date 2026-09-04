@@ -31,14 +31,27 @@ except ImportError:
     HAS_PANDAS = False
 
 # 政府站憑證在 Python 3.14 + OpenSSL 3.5 嚴格校驗下會因 Missing Subject Key Identifier 被拒
-# （Cloud 上 3.14.7 已復現），改用 unverified 以避免全量搜尋直接 0 筆
-try:
-    _SSL_CTX = ssl._create_unverified_context()
-    # 額外關閉 X509_STRICT 以相容舊憑證（若 Python 版本支援）
-    if hasattr(ssl, "VERIFY_X509_STRICT"):
-        _SSL_CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT
-except Exception:
-    _SSL_CTX = None
+# （Cloud 上 3.14.7 已復現），預設改用 unverified 以避免全量搜尋直接 0 筆。
+# 可透過環境變數 PCC_VERIFY_SSL=1 強制開啟驗證（正式環境/除錯用）。
+def _build_ssl_context():
+    if os.getenv("PCC_VERIFY_SSL", "0") == "1":
+        try:
+            ctx = ssl.create_default_context()
+            if hasattr(ssl, "VERIFY_X509_STRICT"):
+                ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+            return ctx
+        except Exception:
+            return None
+    try:
+        ctx = ssl._create_unverified_context()
+        if hasattr(ssl, "VERIFY_X509_STRICT"):
+            ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        return ctx
+    except Exception:
+        return None
+
+
+_SSL_CTX = _build_ssl_context()
 
 
 # ==================== 網站端點與常數 ====================
@@ -49,7 +62,7 @@ BASIC_INDEX_URL = BASE_URL + "/prkms/tender/common/basic/indexTenderBasic"
 DETAIL_URL = BASE_URL + "/tps/QueryTender/query/searchTenderDetail"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Content-Type": "application/x-www-form-urlencoded",
@@ -133,13 +146,36 @@ PREFERRED_COLS = [
 # 僅供內部流程使用、不應出現在匯出檔中的鍵
 INTERNAL_KEYS = ("pk", "命中關鍵字群")
 
-if _SSL_CTX is not None:
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(CookieJar()),
-        urllib.request.HTTPSHandler(context=_SSL_CTX),
-    )
-else:
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+import threading as _threading
+
+_thread_local = _threading.local()
+
+
+def _build_opener():
+    if _SSL_CTX is not None:
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()),
+            urllib.request.HTTPSHandler(context=_SSL_CTX),
+        )
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+
+# 全域 opener 保留供舊測試 monkeypatch 相容；實際請求走 get_opener() 的 thread-local 實例
+opener = _build_opener()
+
+
+def get_opener():
+    """取得當前執行緒獨立的 opener（避免多執行緒共用 CookieJar 產生競態）。"""
+    # 測試時 monkeypatch 會對 opener.open 做替換（寫入實例 __dict__），此時必須回傳被 mock 的全域實例
+    try:
+        if "open" in getattr(opener, "__dict__", {}):
+            return opener
+    except Exception:
+        pass
+    if hasattr(_thread_local, "opener"):
+        return _thread_local.opener
+    _thread_local.opener = _build_opener()
+    return _thread_local.opener
 
 
 # ==================== 環境設定 ====================
@@ -220,7 +256,7 @@ def http_post(url: str, data: dict, max_retries: int = 3, timeout: int = 15) -> 
     for attempt in range(1, max_retries + 1):
         try:
             req = urllib.request.Request(url, data=encoded, headers=HEADERS)
-            with opener.open(req, timeout=timeout) as resp:
+            with get_opener().open(req, timeout=timeout) as resp:
                 return resp.read().decode("utf-8", errors="replace")
         except Exception as e:
             last_err = e
@@ -235,7 +271,7 @@ def http_get(url: str, max_retries: int = 2, timeout: int = 12) -> str:
     for attempt in range(1, max_retries + 1):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with opener.open(req, timeout=timeout) as resp:
+            with get_opener().open(req, timeout=timeout) as resp:
                 return resp.read().decode("utf-8", errors="replace")
         except Exception as e:
             last_err = e

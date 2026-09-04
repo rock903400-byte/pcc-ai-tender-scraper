@@ -27,12 +27,28 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-try:
-    _MIRROR_SSL_CTX = ssl._create_unverified_context()
-    if hasattr(ssl, "VERIFY_X509_STRICT"):
-        _MIRROR_SSL_CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT
-except Exception:
-    _MIRROR_SSL_CTX = None
+import os as _os
+
+
+def _build_mirror_ssl_context():
+    if _os.getenv("PCC_VERIFY_SSL", "0") == "1":
+        try:
+            ctx = ssl.create_default_context()
+            if hasattr(ssl, "VERIFY_X509_STRICT"):
+                ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+            return ctx
+        except Exception:
+            return None
+    try:
+        ctx = ssl._create_unverified_context()
+        if hasattr(ssl, "VERIFY_X509_STRICT"):
+            ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        return ctx
+    except Exception:
+        return None
+
+
+_MIRROR_SSL_CTX = _build_mirror_ssl_context()
 
 
 # ==================== 端點與節流 ====================
@@ -46,7 +62,7 @@ SEARCH_BY_TITLE_PATH = "/api/searchbytitle"
 # 不共用 core.HEADERS：那組帶著 Origin / Referer / Content-Type，是給官網表單用的。
 MIRROR_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+                   "(KHTML, like Gecko) Chrome/135.0 Safari/537.36"),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-TW,zh;q=0.9",
 }

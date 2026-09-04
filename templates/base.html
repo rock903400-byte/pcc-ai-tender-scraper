@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>政府採購網 — AI/資訊 勞務最低標爬蟲（Flask 輕量版）</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="title">
+    <h1>🏛️ 政府電子採購網 — AI / 資訊 勞務最低標標案爬蟲</h1>
+    <p class="subtitle">全面掃描該條件下全部標案 · 關鍵字標記與多維度篩選 · 鏡像為主、官網備援 · 本機 Flask 版</p>
+  </div>
+  <div class="badge" id="badge-status">就緒</div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h3>⚙️ 搜尋條件</h3>
+    <label>關鍵字（空格分隔，僅用於精選）</label>
+    <input id="kw-input" type="text" value="{{ kw_default }}" placeholder="AI 人工智慧 資安…">
+    <button id="btn-reset-kw" class="btn ghost" style="margin-top:6px;width:100%">↩️ 重設為預設</button>
+
+    <hr>
+    <label>日期模式</label>
+    <select id="date-mode">
+      {% for o in date_mode_options %}
+      <option value="{{o}}" {% if o==date_mode_saved %}selected{% endif %}>{{o}}</option>
+      {% endfor %}
+    </select>
+
+    <label>查詢天數</label>
+    <select id="days">
+      {% for o in days_options %}
+      <option value="{{o}}" {% if o==days_saved %}selected{% endif %}>{{o}}</option>
+      {% endfor %}
+    </select>
+
+    <!-- 進階設定預設收合，販售版保持勞務+最低標 -->
+    <details style="margin-top:10px"><summary>進階設定（採購性質/決標方式）</summary>
+      <label>採購性質</label>
+      <select id="attr">
+        {% for o in attr_options %}
+        <option value="{{o}}" {% if o==attr_saved %}selected{% endif %}>{{o}}</option>
+        {% endfor %}
+      </select>
+      <label>決標方式</label>
+      <select id="award">
+        {% for o in award_options %}
+        <option value="{{o}}" {% if o==award_saved %}selected{% endif %}>{{o}}</option>
+        {% endfor %}
+      </select>
+      <label><input type="checkbox" id="verify" checked> 深度校驗決標方式</label>
+      <label><input type="checkbox" id="include-misses"> 包含未命中關鍵字</label>
+      <label><input type="checkbox" id="hide-pending"> 隱藏待確認（🟠）</label>
+    </details>
+
+    <hr>
+    <button id="btn-search" class="btn primary">🚀 開始搜尋標案</button>
+    <div id="rate-hint" class="hint"></div>
+    <button id="btn-stop" class="btn danger" style="display:none">⏹️ 停止搜尋</button>
+
+    <h4 style="margin-top:18px">背景補齊</h4>
+    <button id="btn-trickle" class="btn">🔄 立即補齊 40 筆決標方式</button>
+    <button id="btn-stop-trickle" class="btn danger" style="display:none">⏹️ 停止補齊</button>
+
+    <hr>
+    <div class="hint">輸出資料夾：<code>output/</code></div>
+    <div class="hint">快取/追蹤/佇列位於 <code>output/</code></div>
+
+    <div class="progress" id="progress-wrap" style="display:none">
+      <div class="progress-bar" id="progress-bar"></div>
+      <div class="progress-text" id="progress-text"></div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <div class="kpi" id="kpi-row">
+      <div class="card"><div class="k">🏆 精選</div><div class="v" id="k-qual">0 筆</div><div class="hint" id="k-hits"></div></div>
+      <div class="card"><div class="k">🟠 待確認</div><div class="v" id="k-pending">0 筆</div></div>
+      <div class="card"><div class="k">⭐ 追蹤中</div><div class="v" id="k-watch">0 筆</div></div>
+      <div class="card" style="opacity:.6"><div class="k">📋 全部</div><div class="v" id="k-total">0 筆</div></div>
+    </div>
+
+    <div id="notices"></div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="matched">🏆 精選</button>
+      <button class="tab" data-tab="watchlist">⭐ 追蹤清單</button>
+      <button class="tab" data-tab="dashboard">📊 數據分析</button>
+      <a href="#" onclick="document.getElementById('adv-all').style.display='block'; showTab('all'); return false;" style="font-size:12px;margin-left:auto;align-self:center;opacity:.6">展開查看全部標案</a>
+    </div>
+
+    <!-- 精選（販售核心） -->
+    <section class="panel active" id="panel-matched">
+      <div class="filter-bar">
+        <input id="q-matched" placeholder="🔍 快速搜尋（機關 / 案名 / 案號 / 關鍵字）" style="flex:1">
+        <select id="sort-matched">
+          {% for o in sort_options %}<option value="{{o}}">{{o}}</option>{% endfor %}
+        </select>
+      </div>
+      <details class="adv"><summary>🎛️ 篩選（急迫度 / 決標狀態）</summary>
+        <div class="adv-grid">
+          <label>截標急迫度 <select id="urgency-matched">{% for o in urgency_options %}<option value="{{o}}">{{o}}</option>{% endfor %}</select></label>
+          <label>決標狀態 <select id="award-matched">{% for o in award_status_options %}<option value="{{o}}">{{o}}</option>{% endfor %}</select></label>
+        </div>
+        <details style="margin-top:8px"><summary>更多篩選（預算 / 機關）</summary>
+          <div class="adv-grid" style="margin-top:8px">
+            <label>預算範圍 (萬元) <input type="range" id="budget-min-matched" min="0" max="2000" step="50" value="0"> - <input type="range" id="budget-max-matched" min="0" max="2000" step="50" value="2000"></label>
+            <label>招標機關（逗號分隔）<input id="agencies-matched" placeholder="例如 臺北市,交通部"></label>
+          </div>
+        </details>
+        <button class="btn ghost" onclick="clearAdv('matched')" style="margin-top:8px">🧹 清除篩選</button>
+      </details>
+      <div class="table-wrap"><table id="tbl-matched"><thead></thead><tbody></tbody></table></div>
+      <div class="pagination" id="pag-matched"></div>
+      <div class="actions">
+        <button id="btn-add-matched" class="btn">➕ 加入追蹤（已選 0 筆）</button>
+        <a id="dl-xlsx-matched" class="btn">📊 下載 Excel（精選+全部）</a>
+        <a id="dl-csv-matched" class="btn">📄 下載 CSV（精選）</a>
+      </div>
+    </section>
+
+    <!-- 所有（預設隱藏，給進階用戶） -->
+    <section class="panel" id="panel-all">
+      <div id="adv-all" style="display:none">
+        <div class="filter-bar">
+          <input id="q-all" placeholder="🔍 快速搜尋" style="flex:1">
+          <select id="sort-all">{% for o in sort_options %}<option value="{{o}}">{{o}}</option>{% endfor %}</select>
+        </div>
+        <details class="adv"><summary>🎛️ 篩選器</summary>
+          <div class="adv-grid">
+            <label>預算 <input type="range" id="budget-min-all" min="0" max="2000" step="50" value="0"> - <input type="range" id="budget-max-all" min="0" max="2000" step="50" value="2000"></label>
+            <label>急迫度 <select id="urgency-all">{% for o in urgency_options %}<option>{{o}}</option>{% endfor %}</select></label>
+            <label>決標狀態 <select id="award-all">{% for o in award_status_options %}<option>{{o}}</option>{% endfor %}</select></label>
+            <label>機關 <input id="agencies-all" placeholder="逗號分隔"></label>
+          </div>
+          <button class="btn ghost" onclick="clearAdv('all')">🧹 清除</button>
+        </details>
+        <div class="table-wrap"><table id="tbl-all"><thead></thead><tbody></tbody></table></div>
+        <div class="pagination" id="pag-all"></div>
+        <div class="actions">
+          <button id="btn-add-all" class="btn">➕ 加入追蹤（已選 0 筆）</button>
+          <a id="dl-csv-all" class="btn">📄 下載 CSV（全部）</a>
+        </div>
+      </div>
+      <button class="btn ghost" onclick="document.getElementById('adv-all').style.display='block'; loadTable('all')" style="width:100%">展開查看全部標案（進階）</button>
+    </section>
+
+    <!-- 看板（精簡版：KPI + 急迫度 1 張，其餘收合） -->
+    <section class="panel" id="panel-dashboard">
+      <div class="kpi">
+        <div class="card"><div class="k">💰 總預算</div><div class="v" id="d-total-budget">-</div></div>
+        <div class="card"><div class="k">📈 平均</div><div class="v" id="d-avg">-</div></div>
+        <div class="card"><div class="k">🏆 最高</div><div class="v" id="d-max">-</div></div>
+        <div class="card"><div class="k">🛡️ 確認率</div><div class="v" id="d-conf">-</div></div>
+      </div>
+      <div><h3>⏳ 截標急迫度</h3><canvas id="chart-urgency"></canvas></div>
+      <details style="margin-top:12px"><summary>展開更多分析（預算級距/決標方式/機關/關鍵字）</summary>
+        <div class="grid2" style="margin-top:10px">
+          <div><h3>📊 預算級距</h3><canvas id="chart-tier"></canvas></div>
+          <div><h3>⚖️ 決標方式</h3><canvas id="chart-award"></canvas></div>
+        </div>
+        <div class="grid2">
+          <div><h3>🏛️ Top 10 機關</h3><canvas id="chart-agency"></canvas></div>
+          <div><h3>🏷️ 關鍵字排行</h3><canvas id="chart-kw"></canvas></div>
+        </div>
+      </details>
+    </section>
+
+    <!-- 追蹤 -->
+    <section class="panel" id="panel-watchlist">
+      <div class="filter-bar">
+        <select id="sort-watchlist">{% for o in sort_options %}<option>{{o}}</option>{% endfor %}</select>
+        <button id="btn-remove-wl" class="btn danger">🗑️ 移出選取</button>
+        <button id="btn-clear-wl" class="btn danger">🧹 清空所有</button>
+        <a id="dl-csv-wl" class="btn">📄 匯出追蹤 CSV</a>
+      </div>
+      <div class="table-wrap"><table id="tbl-watchlist"><thead></thead><tbody></tbody></table></div>
+      <div class="pagination" id="pag-watchlist"></div>
+    </section>
+
+    <!-- 紀錄（收合為抽屜，不占 Tab） -->
+    <details style="margin-top:16px;opacity:.7"><summary>📝 執行紀錄（除錯用）</summary>
+      <pre id="log-box" class="log" style="max-height:200px"></pre>
+      <button id="btn-clear-log" class="btn ghost">🧹 清空紀錄</button>
+      <a id="dl-log" class="btn">⬇️ 下載紀錄 .txt</a>
+    </details>
+
+    <footer class="footer">政府採購網標案爬蟲 · Flask 輕量版 · 核心邏輯與 CLI 共用 pcc_core · 鏡像為主、官網備援 · <code>python app.py</code> 啟動</footer>
+  </main>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

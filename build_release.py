@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-建置腳本（歷史遺留：桌面 ttkbootstrap 版）
+建置腳本 — Flask 輕量版
 
-本專案已改為 Streamlit Web 版（`streamlit run app.py`），不再需要 PyInstaller 打包。
-此檔案僅為相容保留，若仍需打包 Streamlit 請改用 `pip install streamlit` 直接執行，
-或自行以 `pyinstaller --collect-all streamlit` 重寫。
+取代舊 Streamlit/ttkbootstrap 打包，改為 Flask + PyInstaller。
+支援 onedir（秒開綠色版，推薦）與 onefile（單檔）雙模式。
+
+用法：
+    python build_release.py          # 雙模式
+    python build_release.py --onedir  # 僅綠色版
+    python build_release.py --onefile # 僅單檔
 """
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -49,11 +54,19 @@ def get_exclude_flags():
         flags.extend(["--exclude-module", mod])
     return flags
 
+def base_flags():
+    # Flask 不需要 --collect-all streamlit，改收 flask/jinja2
+    return [
+        "--collect-all", "flask",
+        "--collect-all", "jinja2",
+        "--hidden-import", "jinja2.ext",
+    ]
+
 def build_onedir():
     print("\n" + "=" * 60)
-    print("[1/2] 正在建置：【秒開綠色版 (--onedir)】...")
+    print("[1/2] 正在建置：【Flask 綠色版 (--onedir) 秒開】...")
     print("=" * 60)
-    name = "政府採購網標案爬蟲_秒開版"
+    name = "政府採購網標案爬蟲_Flask"
     target_dir = os.path.join(DIST_DIR, name)
     if os.path.exists(target_dir):
         try:
@@ -61,67 +74,84 @@ def build_onedir():
         except Exception:
             pass
 
-    print("[SKIP] 本專案已為 Streamlit 版，無需 ttkbootstrap 打包。請直接 `streamlit run app.py`。")
-    return
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "-y",
         "--noconsole",
         "--onedir",
         "--name", name,
-        "--collect-all", "streamlit",
-    ] + get_exclude_flags() + ["app.py"]
-    
+        "--add-data", f"templates{os.pathsep}templates",
+        "--add-data", f"static{os.pathsep}static",
+    ] + base_flags() + get_exclude_flags() + ["app.py"]
+
     start_t = time.time()
     res = subprocess.run(cmd, cwd=PROJECT_DIR)
     dur = time.time() - start_t
-    
+
     exe_path = os.path.join(target_dir, f"{name}.exe")
-    if res.returncode == 0 or os.path.exists(exe_path):
-        print(f"[SUCCESS] 秒開綠色版建置成功 (耗時 {dur:.1f} 秒)！")
+    if res.returncode == 0 and os.path.exists(exe_path):
+        size_mb = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(target_dir) for f in fs) / (1024*1024)
+        print(f"[SUCCESS] 綠色版建置成功 (耗時 {dur:.1f}s, 總大小 {size_mb:.1f} MB)")
         print(f"  執行路徑: {exe_path}")
+        print(f"  雙擊即可啟動，自動開瀏覽器 http://localhost:8502")
+        return True
     else:
-        print("[FAIL] 秒開綠色版建置失敗！")
+        print("[FAIL] 綠色版建置失敗！")
+        if res.returncode != 0:
+            print(f"  returncode={res.returncode}")
+        return False
 
 def build_onefile():
     print("\n" + "=" * 60)
-    print("[2/2] 正在建置：【極速瘦身單檔版 (--onefile)】...")
+    print("[2/2] 正在建置：【Flask 單檔版 (--onefile)】...")
     print("=" * 60)
-    name = "政府採購網標案爬蟲"
-    print("[SKIP] 本專案已為 Streamlit 版，無需 ttkbootstrap 打包。請直接 `streamlit run app.py`。")
-    return
+    name = "政府採購網標案爬蟲_Flask_單檔"
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "-y",
         "--noconsole",
         "--onefile",
         "--name", name,
-        "--collect-all", "streamlit",
-    ] + get_exclude_flags() + ["app.py"]
-    
+        "--add-data", f"templates{os.pathsep}templates",
+        "--add-data", f"static{os.pathsep}static",
+    ] + base_flags() + get_exclude_flags() + ["app.py"]
+
     start_t = time.time()
     res = subprocess.run(cmd, cwd=PROJECT_DIR)
     dur = time.time() - start_t
-    
-    if res.returncode == 0:
-        exe_path = os.path.join(DIST_DIR, f"{name}.exe")
-        size_mb = os.path.getsize(exe_path) / (1024 * 1024) if os.path.exists(exe_path) else 0
-        print(f"[SUCCESS] 極速瘦身單檔版建置成功 (耗時 {dur:.1f} 秒)！")
-        print(f"  檔案大小: {size_mb:.1f} MB (原版為 162 MB，大幅瘦身！)")
+
+    exe_path = os.path.join(DIST_DIR, f"{name}.exe")
+    if res.returncode == 0 and os.path.exists(exe_path):
+        size_mb = os.path.getsize(exe_path) / (1024*1024)
+        print(f"[SUCCESS] 單檔版建置成功 (耗時 {dur:.1f}s, 大小 {size_mb:.1f} MB)")
         print(f"  執行路徑: {exe_path}")
+        return True
     else:
-        print("[FAIL] 極速瘦身單檔版建置失敗！")
+        print("[FAIL] 單檔版建置失敗！")
+        return False
 
 def main():
+    parser = argparse.ArgumentParser(description="Flask 版建置")
+    parser.add_argument("--onedir", action="store_true", help="僅建綠色版")
+    parser.add_argument("--onefile", action="store_true", help="僅建單檔版")
+    args = parser.parse_args()
+
     print("=" * 60)
-    print("[*] 開始執行雙模式發布建置...")
+    print("[*] 開始執行 Flask 版建置...")
     print("=" * 60)
-    
-    build_onedir()
-    build_onefile()
-    
+
+    do_onedir = args.onedir or not args.onefile
+    do_onefile = args.onefile or not args.onedir
+
+    ok1 = build_onedir() if do_onedir else True
+    ok2 = build_onefile() if do_onefile else True
+
     print("\n" + "=" * 60)
-    print("[*] 所有建置與優化已完成！")
+    if ok1 and ok2:
+        print("[*] 建置完成！")
+    else:
+        print("[*] 建置結束（部分失敗，請看上方日誌）")
     print(f"檔案輸出目錄: {DIST_DIR}")
     print("=" * 60)
 
