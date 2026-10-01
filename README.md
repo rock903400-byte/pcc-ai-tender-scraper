@@ -1,8 +1,11 @@
 # PCC AI & IT Service Tender Scraper (政府採購網 AI/資訊 勞務最低標爬蟲)
 
 [![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/rock903400-byte/pcc-ai-tender-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/rock903400-byte/pcc-ai-tender-scraper/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![UI: Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io/)
+
+> 現行介面為 Streamlit Web + Flask + CLI 共用同一核心（`pcc_core.py`）；舊 ttkbootstrap 桌面版已封存至 `archive/`，僅供歷史參考。
 
 專門針對**台灣政府電子採購網 ([web.pcc.gov.tw](https://web.pcc.gov.tw))** 設計的自動化標案爬蟲與 Web 操作介面。
 
