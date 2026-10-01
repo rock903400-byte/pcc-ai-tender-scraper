@@ -7,4 +7,4 @@ openpyxl==3.1.5
 pyarrow==24.0.0
 
 # Web 操作介面（Flask 輕量版，無 Streamlit）
-Flask==3.1.0
+Flask==3.1.3
